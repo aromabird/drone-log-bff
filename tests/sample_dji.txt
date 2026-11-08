@@ -1,0 +1,7 @@
+# Dummy DJI flight log for the BFF prototype
+# The current parser intentionally ignores this content.
+Flight date: 2026-11-07
+Takeoff: 10:00
+Landing: 10:15
+Latitude: 35.8988
+Longitude: 140.6385
