@@ -9,6 +9,9 @@ PWA がそのまま使える飛行サマリー JSON を返します。
 準拠した Excel テンプレートへ入力を書き込み、`openpyxl` + `io.BytesIO` で
 オンメモリ生成した `.xlsx` を返します（ディスクへは保存しません）。
 
+`GET /api/check-infrastructure` では、指定座標の周辺にある送電線・鉄塔を
+Overpass API（OpenStreetMap）から取得し、PWA のリスク判定用 JSON を返します。
+
 DJI の内部時刻は UTC で記録されるため、日付・離着陸時刻は必ず JST（UTC+9）へ
 変換して返します。アップロードされた内容はメモリ上で読み捨て、ディスクへ
 保存しません。
@@ -62,6 +65,45 @@ export DJI_API_KEY="<DJI Developer API Key>"
 ```json
 {"status": "ok", "service": "drone-log-bff"}
 ```
+
+### `GET /api/check-infrastructure`
+
+指定座標から半径 `radius` メートル以内の `power=tower`（鉄塔）と
+`power=line`（送電線）を数え、PWA のリスク判定用 JSON を返します。
+
+- クエリパラメータ
+  - `lat`（必須）: 緯度 `-90.0`〜`90.0`
+  - `lon`（必須）: 経度 `-180.0`〜`180.0`
+  - `radius`（任意）: 検索半径（m）。既定 `300`、`50`〜`2000`
+- 成功時: `200` + 下記 JSON
+- 入力不備: `422`（FastAPI 標準）
+- Overpass 混雑・障害: 公式 OSM API（`/api/0.6/map`）へ自動フォールバック
+  - フォールバックも失敗した場合は `502` / `503` / `504` + エラーコード
+
+```json
+{
+  "power_risk_detected": false,
+  "towers_count": 0,
+  "lines_count": 0,
+  "message": "周辺インフラ（送電線・鉄塔）の異常なし"
+}
+```
+
+リスクがある場合は `power_risk_detected=true` になり、`message` に鉄塔数・
+送電線数と飛行前の確認事項が入ります。PWA はこの値で赤（警告）／緑（安全）の
+アラートを切り替えます。
+
+```bash
+curl -sS \
+  'http://127.0.0.1:8000/api/check-infrastructure?lat=35.9000&lon=140.0000&radius=300'
+```
+
+Overpass API は混雑時に `406` / `429` / `502` / `503` / `504` を返すことがあります。
+本 BFF は短い間隔で 1 回再試行し、それでも失敗した場合に公式 OSM API の bbox を
+使って同じ判定を継続します。OSM API の bbox は半径から自動計算し、BFF 側で
+点と線分の距離をメートル単位で評価します。ログには `source=overpass` または
+`source=osm-api` を出力します。接続先は環境変数 `OVERPASS_API_URL` /
+`OSM_API_URL` で変更できます。
 
 ### `POST /api/parse-log`
 
@@ -193,6 +235,10 @@ Excel は `io.BytesIO` 上で生成し、レスポンス後はディスクに残
 - v7〜v12 の実ログでのフレーム解析は未検証（公開サンプルが見つからないため）。
 - v13 以降のフレームは `DJI_API_KEY` がないと復号できない。Details は復号可能。
 - ファイルサイズ上限・認証・レート制限は未実装。
+- 周辺インフラ判定は Overpass / OSM API の可用性に依存する。Overpass は
+  2026年時点で混雑が常態化しており、406/タイムアウトが発生する。本 BFF は
+  OSM API へフォールバックするが、半径 2000m など広範囲では OSM API の
+  取得上限（50,000 nodes）に達して失敗する場合がある。PWA は既定の 300m を使う。
 
 ## テスト
 
@@ -213,6 +259,12 @@ cd drone-log-bff
 6. `file` 未指定（422）
 7. CORS プリフライト
 8. 飛行日誌 Excel の生成（セル値・Content-Type・ファイル名）
+9. 周辺インフラ API の入力バリデーション（緯度91 → 422）
+
+`GET /api/check-infrastructure` の実データ取得は外部 API（Overpass / OSM API）へ
+アクセスするため、`smoke_test.sh` には含めていません。手元では上記の curl 例で確認してください。
+Overpass が混雑している場合は、OSM API フォールバックにより 20〜40 秒ほど
+かかることがあります。
 
 ## CORS
 

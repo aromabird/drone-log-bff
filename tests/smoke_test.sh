@@ -207,4 +207,21 @@ workbook.close()
 print("   export-log OK:", path)
 PY
 
+echo "9) check-infrastructure validation"
+STATUS="$(curl -sS --max-time 10 -o "$TMP_DIR/infra_invalid.json" -w '%{http_code}' \
+  "$BASE_URL/api/check-infrastructure?lat=91&lon=140")"
+if [ "$STATUS" != "422" ]; then
+  echo "ERROR: 422 を期待しましたが $STATUS でした。" >&2
+  cat "$TMP_DIR/infra_invalid.json" >&2
+  exit 1
+fi
+"$PYTHON" - "$TMP_DIR/infra_invalid.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert isinstance(data.get("detail"), list), data
+print("   check-infrastructure validation OK: 422")
+PY
+
 echo "ALL TESTS PASSED"

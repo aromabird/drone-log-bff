@@ -3,6 +3,7 @@
 `POST /api/parse-log` で DJI の `.txt` ログをバイナリ解析し、PWA が使う
 日付・離着陸時刻（JST）・飛行時間・離陸地点を返す。`POST /api/export-log` では
 様式1の Excel テンプレートへ入力を書き込み、オンメモリで `.xlsx` を返す。
+`GET /api/check-infrastructure` では Overpass API から周辺の送電線・鉄塔を取得する。
 
 解析には `pydjirecord` を使う。DJI の内部時刻は UTC で記録されるため、
 レスポンスは必ず JST（UTC+9）へ変換する。v13 以降のフレーム（GPS 軌跡）は
@@ -17,13 +18,16 @@ import logging
 import math
 import os
 import re
+import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import requests
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from openpyxl import load_workbook
@@ -46,6 +50,22 @@ EXCEL_MEDIA_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
 
+# 周辺インフラ（送電線・鉄塔）の取得先。環境変数で上書きできる。
+OVERPASS_API_URL = os.getenv(
+    "OVERPASS_API_URL", "http://overpass-api.de/api/interpreter"
+).strip()
+OVERPASS_REQUEST_TIMEOUT = (4.0, 12.0)
+OVERPASS_MAX_ATTEMPTS = 2
+OVERPASS_RETRY_DELAY_SECONDS = 1.5
+OVERPASS_TRANSIENT_STATUS = frozenset({406, 429, 502, 503, 504})
+
+# Overpass が混雑・障害のときだけ使う公式 OSM API のフォールバック。
+# bbox 内の全要素を取得し、BFF 側で半径内の鉄塔・送電線を数える。
+OSM_API_URL = os.getenv(
+    "OSM_API_URL", "https://api.openstreetmap.org/api/0.6/map"
+).strip()
+OSM_API_TIMEOUT = (4.0, 15.0)
+
 logger = logging.getLogger(SERVICE_NAME)
 logging.basicConfig(
     level=logging.INFO,
@@ -58,8 +78,9 @@ app = FastAPI(
         "ドローン飛行日誌 PWA のバックエンド。"
         "DJI の .txt ログをバイナリ解析し、JST の離着陸時刻・飛行時間・"
         "離陸地点を返します。飛行日誌の Excel（様式1）も生成できます。"
+        "周辺の送電線・鉄塔は Overpass API から取得します。"
     ),
-    version="0.3.1",
+    version="0.3.2",
 )
 
 # プロトタイプ用の CORS 設定。PWA は cookie を使わないため credentials は無効。
@@ -75,6 +96,17 @@ app.add_middleware(
 )
 
 Coordinates = tuple[float, float]
+
+
+class InfrastructureRisk(BaseModel):
+    """周辺インフラ（送電線・鉄塔）のチェック結果。"""
+
+    power_risk_detected: bool = Field(
+        ..., description="鉄塔または送電線が1つ以上あれば true"
+    )
+    towers_count: int = Field(..., ge=0, description="検索範囲内の鉄塔数")
+    lines_count: int = Field(..., ge=0, description="検索範囲内の送電線数")
+    message: str = Field(..., description="PWA に表示する判定メッセージ")
 
 
 class FlightRecord(BaseModel):
@@ -317,10 +349,390 @@ def _to_response(filename: str, summary: FlightSummary) -> dict[str, object]:
     }
 
 
+def _overpass_query(lat: float, lon: float, radius: int) -> str:
+    """指定座標の周辺にある鉄塔（node）と送電線（way）を取得するクエリ。"""
+
+    return (
+        "[out:json][timeout:10];\n"
+        "(\n"
+        f'  node["power"="tower"](around:{radius},{lat:.6f},{lon:.6f});\n'
+        f'  way["power"="line"](around:{radius},{lat:.6f},{lon:.6f});\n'
+        ");\n"
+        "out body;\n"
+        ">\n"
+        "out skel qt;"
+    )
+
+
+def _overpass_error(code: str, message: str, status_code: int) -> HTTPException:
+    """PWA が表示できる構造化エラーを返す。"""
+
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
+def _request_overpass(query: str) -> dict[str, Any]:
+    """Overpass API へクエリを送り、JSON を返す。
+
+    Overpass は混雑時に 406/429/502/503/504 を返すことがあるため、短い間隔で
+    1 回だけ再試行する。タイムアウト・接続失敗も同じ回数まで再試行し、最終的に
+    構造化エラーへ変換する。クエリ以外の個人情報は送信しない。
+    """
+
+    last_reason = "unknown"
+
+    for attempt in range(1, OVERPASS_MAX_ATTEMPTS + 1):
+        try:
+            response = requests.post(
+                OVERPASS_API_URL,
+                data={"data": query},
+                headers={
+                    "User-Agent": f"{SERVICE_NAME}/0.3.2",
+                    "Accept": "application/json",
+                },
+                timeout=OVERPASS_REQUEST_TIMEOUT,
+            )
+        except requests.Timeout as exc:
+            last_reason = "timeout"
+            logger.warning(
+                "overpass timeout: attempt=%d/%d", attempt, OVERPASS_MAX_ATTEMPTS
+            )
+            if attempt < OVERPASS_MAX_ATTEMPTS:
+                time.sleep(OVERPASS_RETRY_DELAY_SECONDS * attempt)
+                continue
+            raise _overpass_error(
+                "overpass_timeout",
+                "周辺インフラ情報の取得がタイムアウトしました。時間をおいて再試行してください。",
+                504,
+            ) from exc
+        except requests.RequestException as exc:
+            last_reason = type(exc).__name__
+            logger.warning(
+                "overpass request failed: attempt=%d/%d error=%s",
+                attempt,
+                OVERPASS_MAX_ATTEMPTS,
+                type(exc).__name__,
+            )
+            if attempt < OVERPASS_MAX_ATTEMPTS:
+                time.sleep(OVERPASS_RETRY_DELAY_SECONDS * attempt)
+                continue
+            raise _overpass_error(
+                "overpass_unavailable",
+                "周辺インフラ情報を取得できませんでした。通信状況を確認して再試行してください。",
+                502,
+            ) from exc
+
+        if response.status_code == 200:
+            try:
+                payload = response.json()
+            except ValueError as exc:
+                last_reason = "invalid_json"
+                logger.warning(
+                    "overpass invalid JSON: attempt=%d/%d", attempt, OVERPASS_MAX_ATTEMPTS
+                )
+                if attempt < OVERPASS_MAX_ATTEMPTS:
+                    time.sleep(OVERPASS_RETRY_DELAY_SECONDS * attempt)
+                    continue
+                raise _overpass_error(
+                    "overpass_invalid_response",
+                    "周辺インフラ情報の応答を解析できませんでした。時間をおいて再試行してください。",
+                    502,
+                ) from exc
+
+            if not isinstance(payload, dict):
+                raise _overpass_error(
+                    "overpass_invalid_response",
+                    "周辺インフラ情報の応答形式が不正です。",
+                    502,
+                )
+            return payload
+
+        last_reason = f"HTTP {response.status_code}"
+        logger.warning(
+            "overpass HTTP error: attempt=%d/%d status=%d",
+            attempt,
+            OVERPASS_MAX_ATTEMPTS,
+            response.status_code,
+        )
+
+        if response.status_code in OVERPASS_TRANSIENT_STATUS:
+            if attempt < OVERPASS_MAX_ATTEMPTS:
+                time.sleep(OVERPASS_RETRY_DELAY_SECONDS * attempt)
+                continue
+            raise _overpass_error(
+                "overpass_busy",
+                "Overpass API が混雑しています。時間をおいて再試行してください。",
+                503,
+            )
+
+        raise _overpass_error(
+            "overpass_unavailable",
+            "周辺インフラ情報を取得できませんでした。時間をおいて再試行してください。",
+            502,
+        )
+
+    # 上のループで必ず return / raise するが、型チェックのため残す。
+    logger.error("overpass request exhausted: reason=%s", last_reason)
+    raise _overpass_error(
+        "overpass_unavailable",
+        "周辺インフラ情報を取得できませんでした。",
+        502,
+    )
+
+
+def _count_overpass_elements(payload: dict[str, Any]) -> tuple[int, int]:
+    """Overpass の elements から鉄塔と送電線を数える。"""
+
+    elements = payload.get("elements", [])
+    if not isinstance(elements, list):
+        raise _overpass_error(
+            "overpass_invalid_response",
+            "周辺インフラ情報の応答形式が不正です。",
+            502,
+        )
+
+    towers_count = 0
+    lines_count = 0
+    for element in elements:
+        if not isinstance(element, dict):
+            continue
+        tags = element.get("tags")
+        if not isinstance(tags, dict):
+            continue
+        power = tags.get("power")
+        if power == "tower":
+            towers_count += 1
+        elif power == "line":
+            lines_count += 1
+    return towers_count, lines_count
+
+
+def _osm_bbox(lat: float, lon: float, radius: int) -> tuple[float, float, float, float]:
+    """半径 radius メートルを覆う bbox（min_lon, min_lat, max_lon, max_lat）。"""
+
+    lat_delta = (radius / 111_320.0) * 1.05
+    cos_lat = max(0.01, abs(math.cos(math.radians(lat))))
+    lon_delta = (radius / (111_320.0 * cos_lat)) * 1.05
+    return (
+        max(-180.0, lon - lon_delta),
+        max(-90.0, lat - lat_delta),
+        min(180.0, lon + lon_delta),
+        min(90.0, lat + lat_delta),
+    )
+
+
+def _local_xy_m(
+    lat: float, lon: float, origin_lat: float, origin_lon: float
+) -> tuple[float, float]:
+    """緯度経度を、原点からの局所平面（メートル）へ近似変換する。"""
+
+    x = math.radians(lon - origin_lon) * 6_371_000.0 * math.cos(math.radians(origin_lat))
+    y = math.radians(lat - origin_lat) * 6_371_000.0
+    return x, y
+
+
+def _point_segment_distance_m(
+    px: float,
+    py: float,
+    ax: float,
+    ay: float,
+    bx: float,
+    by: float,
+) -> float:
+    """点 P と線分 AB の最短距離（メートル）。"""
+
+    dx = bx - ax
+    dy = by - ay
+    if dx == 0.0 and dy == 0.0:
+        return math.hypot(px - ax, py - ay)
+    t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy)
+    t = max(0.0, min(1.0, t))
+    return math.hypot(px - (ax + t * dx), py - (ay + t * dy))
+
+
+def _count_osm_api_elements(
+    root: ET.Element, lat: float, lon: float, radius: int
+) -> tuple[int, int]:
+    """OSM API の XML から、半径内の鉄塔と送電線を数える。"""
+
+    nodes: dict[str, tuple[float, float]] = {}
+    for node in root.findall("node"):
+        node_id = node.get("id")
+        try:
+            node_lat = float(node.get("lat", ""))
+            node_lon = float(node.get("lon", ""))
+        except (TypeError, ValueError):
+            continue
+        if node_id:
+            nodes[node_id] = (node_lat, node_lon)
+
+    towers_count = 0
+    for node in root.findall("node"):
+        tags = {tag.get("k"): tag.get("v") for tag in node.findall("tag")}
+        if tags.get("power") != "tower":
+            continue
+        node_id = node.get("id")
+        if not node_id or node_id not in nodes:
+            continue
+        node_lat, node_lon = nodes[node_id]
+        x, y = _local_xy_m(node_lat, node_lon, lat, lon)
+        if math.hypot(x, y) <= radius:
+            towers_count += 1
+
+    lines_count = 0
+    for way in root.findall("way"):
+        tags = {tag.get("k"): tag.get("v") for tag in way.findall("tag")}
+        if tags.get("power") != "line":
+            continue
+
+        coords = []
+        for nd in way.findall("nd"):
+            ref = nd.get("ref")
+            if ref and ref in nodes:
+                coords.append(nodes[ref])
+        if not coords:
+            continue
+
+        points = [_local_xy_m(node_lat, node_lon, lat, lon) for node_lat, node_lon in coords]
+        if len(points) == 1:
+            hit = math.hypot(points[0][0], points[0][1]) <= radius
+        else:
+            hit = any(
+                _point_segment_distance_m(0.0, 0.0, ax, ay, bx, by) <= radius
+                for (ax, ay), (bx, by) in zip(points, points[1:])
+            )
+        if hit:
+            lines_count += 1
+
+    return towers_count, lines_count
+
+
+def _fetch_osm_api_counts(lat: float, lon: float, radius: int) -> tuple[int, int]:
+    """Overpass 障害時のフォールバック。公式 OSM API の bbox から数える。"""
+
+    min_lon, min_lat, max_lon, max_lat = _osm_bbox(lat, lon, radius)
+    url = f"{OSM_API_URL}?bbox={min_lon:.7f},{min_lat:.7f},{max_lon:.7f},{max_lat:.7f}"
+
+    try:
+        response = requests.get(
+            url,
+            headers={
+                "User-Agent": f"{SERVICE_NAME}/0.3.2",
+                "Accept": "application/xml",
+            },
+            timeout=OSM_API_TIMEOUT,
+        )
+    except requests.Timeout as exc:
+        raise _overpass_error(
+            "osm_api_timeout",
+            "周辺インフラ情報の取得がタイムアウトしました。時間をおいて再試行してください。",
+            504,
+        ) from exc
+    except requests.RequestException as exc:
+        raise _overpass_error(
+            "osm_api_unavailable",
+            "周辺インフラ情報を取得できませんでした。通信状況を確認して再試行してください。",
+            502,
+        ) from exc
+
+    if response.status_code != 200:
+        logger.warning("OSM API fallback failed: status=%d", response.status_code)
+        raise _overpass_error(
+            "osm_api_unavailable",
+            "周辺インフラ情報を取得できませんでした。時間をおいて再試行してください。",
+            502 if response.status_code < 500 else 503,
+        )
+
+    try:
+        root = ET.fromstring(response.content)
+    except ET.ParseError as exc:
+        raise _overpass_error(
+            "osm_api_invalid_response",
+            "周辺インフラ情報の応答を解析できませんでした。",
+            502,
+        ) from exc
+
+    return _count_osm_api_elements(root, lat, lon, radius)
+
+
 @app.get("/api/health")
 async def health() -> dict[str, str]:
     """起動確認用のヘルスチェック。"""
     return {"status": "ok", "service": SERVICE_NAME}
+
+
+@app.get(
+    "/api/check-infrastructure",
+    response_model=InfrastructureRisk,
+    summary="周辺の送電線・鉄塔を確認する",
+    responses={
+        422: {"description": "緯度・経度・半径の検証エラー"},
+        502: {"description": "Overpass API への接続失敗・不正な応答"},
+        503: {"description": "Overpass API の混雑"},
+        504: {"description": "Overpass API のタイムアウト"},
+    },
+)
+def check_infrastructure(
+    lat: float = Query(..., ge=-90.0, le=90.0, description="緯度"),
+    lon: float = Query(..., ge=-180.0, le=180.0, description="経度"),
+    radius: int = Query(300, ge=50, le=2000, description="検索半径（メートル）"),
+) -> InfrastructureRisk:
+    """指定座標から半径 radius メートル以内の鉄塔・送電線を数える。
+
+    Overpass API の `power=tower`（node）と `power=line`（way）を対象にし、
+    1 つ以上あれば `power_risk_detected=true` を返す。PWA はこの結果を
+    赤（警告）／緑（安全）のアラートとして表示する。Overpass が混雑・
+    障害の場合は、公式 OSM API の bbox から同じ条件で数える。
+    """
+
+    query = _overpass_query(lat, lon, radius)
+    source = "overpass"
+    try:
+        payload = _request_overpass(query)
+        towers_count, lines_count = _count_overpass_elements(payload)
+    except HTTPException as exc:
+        if exc.status_code not in (502, 503, 504):
+            raise
+        code = exc.detail.get("code") if isinstance(exc.detail, dict) else "unknown"
+        logger.warning(
+            "overpass unavailable; falling back to OSM API: status=%d code=%s",
+            exc.status_code,
+            code,
+        )
+        try:
+            towers_count, lines_count = _fetch_osm_api_counts(lat, lon, radius)
+            source = "osm-api"
+        except HTTPException:
+            # フォールバックも失敗した場合は、原因である Overpass のエラーを返す。
+            raise exc
+
+    power_risk_detected = towers_count > 0 or lines_count > 0
+    if power_risk_detected:
+        message = (
+            f"半径{radius}m以内に鉄塔{towers_count}基・送電線{lines_count}件を検知しました。"
+            "飛行前に離隔距離・電磁干渉・緊急時の退避経路を確認してください。"
+        )
+    else:
+        message = "周辺インフラ（送電線・鉄塔）の異常なし"
+
+    logger.info(
+        "check-infrastructure: lat=%.6f lon=%.6f radius=%d towers=%d lines=%d source=%s",
+        lat,
+        lon,
+        radius,
+        towers_count,
+        lines_count,
+        source,
+    )
+
+    return InfrastructureRisk(
+        power_risk_detected=power_risk_detected,
+        towers_count=towers_count,
+        lines_count=lines_count,
+        message=message,
+    )
 
 
 @app.post("/api/parse-log")
