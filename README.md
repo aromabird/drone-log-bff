@@ -148,21 +148,22 @@ curl -sS -D flight_record_headers.txt \
   -o flight_record.xlsx
 ```
 
-セル番地はテンプレートの仮レイアウトです。帳票の正式なセル位置が決まったら、
-`main.py` の書き込み先と `template/flight_record_template.xlsx` を合わせて変更してください。
+セル番地は国交省様式1「無人航空機の飛行記録」の公式テンプレートに合わせています。
+帳票レイアウトを変更する場合は、`main.py` の書き込み先と
+`template/flight_record_template.xlsx`、以下の対応表を合わせて更新してください。
 
 | セル | 項目 | リクエストフィールド |
 |---|---|---|
-| B2 | 飛行年月日 | `date` |
-| D2 | 操縦者氏名 | `operator_name` |
-| B4 | 機体登録記号 | `registration_id` |
-| D4 | 飛行目的 | `purpose` |
-| B6 | 離陸場所 | `location` |
-| D6 | 離陸時刻 | `takeoff_time` |
-| F6 | 着陸時刻 | `landing_time` |
-| H6 | 飛行時間 | `total_time` |
-| B8 | 安全対策 | `safety_measures` |
-| B10 | 備考 | `notes` |
+| B3 | 機体登録記号 | `registration_id` |
+| B5 | 飛行年月日 | `date` |
+| D5 | 操縦者氏名 | `operator_name` |
+| G5 | 飛行概要 | `purpose` |
+| H5 | 離陸場所 | `location` |
+| I5 | 着陸場所 | `location`（離陸場所と同じ値） |
+| L5 | 離陸時刻 | `takeoff_time` |
+| M5 | 着陸時刻 | `landing_time` |
+| O5 | 飛行時間 | `total_time` |
+| Q5 | 安全措置・特記事項 | `safety_measures` / `notes`（` / ` で連結） |
 
 `date` はファイル名にも使います。ファイル名に使えない文字は `_` に置換します。
 Excel は `io.BytesIO` 上で生成し、レスポンス後はディスクに残りません。
@@ -228,7 +229,7 @@ drone-log-bff/
 ├── .gitignore
 ├── README.md
 ├── template/
-│   └── flight_record_template.xlsx  # 様式1のExcelテンプレート（仮セル番地）
+│   └── flight_record_template.xlsx  # 国交省様式1の公式Excelテンプレート
 └── tests/
     ├── sample_dji.txt          # 実ログ v4（Details フォールバック検証）
     ├── invalid_dji.txt         # 解析失敗の検証

@@ -187,17 +187,18 @@ from openpyxl import load_workbook
 path = sys.argv[1]
 workbook = load_workbook(path)
 sheet = workbook.active
+assert sheet.title == "飛行記録", f"unexpected sheet: {sheet.title!r}"
 expected = {
-    "B2": "2026-11-08",
-    "D2": "普施 太郎",
-    "B4": "JU1234567890",
-    "D4": "空撮",
-    "B6": "テスト飛行場",
-    "D6": "10:00",
-    "F6": "10:15",
-    "H6": "15分",
-    "B8": "立入管理措置: 講じる / 飛行前点検: 全項目OK",
-    "B10": "スモークテスト",
+    "B3": "JU1234567890",
+    "B5": "2026-11-08",
+    "D5": "普施 太郎",
+    "G5": "空撮",
+    "H5": "テスト飛行場",
+    "I5": "テスト飛行場",
+    "L5": "10:00",
+    "M5": "10:15",
+    "O5": "15分",
+    "Q5": "立入管理措置: 講じる / 飛行前点検: 全項目OK / スモークテスト",
 }
 for cell, value in expected.items():
     actual = sheet[cell].value

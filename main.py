@@ -59,7 +59,7 @@ app = FastAPI(
         "DJI の .txt ログをバイナリ解析し、JST の離着陸時刻・飛行時間・"
         "離陸地点を返します。飛行日誌の Excel（様式1）も生成できます。"
     ),
-    version="0.3.0",
+    version="0.3.1",
 )
 
 # プロトタイプ用の CORS 設定。PWA は cookie を使わないため credentials は無効。
@@ -399,7 +399,8 @@ def export_log(record: FlightRecord) -> StreamingResponse:
     """飛行日誌テンプレートへ入力を書き込み、Excel を返す。
 
     生成物は `io.BytesIO` 上で完結させ、ディスクへは保存しない。セル番地は
-    テンプレートの仮レイアウトに合わせたもので、将来変更する可能性がある。
+    国交省様式1の公式テンプレートに合わせてあり、変更する場合は README の
+    対応表と `template/flight_record_template.xlsx` も更新すること。
     """
 
     if not TEMPLATE_PATH.is_file():
@@ -418,17 +419,17 @@ def export_log(record: FlightRecord) -> StreamingResponse:
         workbook = load_workbook(TEMPLATE_PATH)
         sheet = workbook.active
 
-        # テンプレート側のラベルと対応する仮のセル番地。
-        sheet["B2"] = record.date
-        sheet["D2"] = record.operator_name
-        sheet["B4"] = record.registration_id
-        sheet["D4"] = record.purpose
-        sheet["B6"] = record.location
-        sheet["D6"] = record.takeoff_time
-        sheet["F6"] = record.landing_time
-        sheet["H6"] = record.total_time
-        sheet["B8"] = record.safety_measures
-        sheet["B10"] = record.notes
+        # 国交省様式1「無人航空機の飛行記録」の入力セル。
+        sheet["B3"] = record.registration_id
+        sheet["B5"] = record.date
+        sheet["D5"] = record.operator_name
+        sheet["G5"] = record.purpose
+        sheet["H5"] = record.location
+        sheet["I5"] = record.location
+        sheet["L5"] = record.takeoff_time
+        sheet["M5"] = record.landing_time
+        sheet["O5"] = record.total_time
+        sheet["Q5"] = f"{record.safety_measures} / {record.notes}"
 
         workbook.save(buffer)
     except Exception as exc:  # noqa: BLE001 - 例外詳細はクライアントへ返さない
