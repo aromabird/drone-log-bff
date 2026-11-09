@@ -1,7 +1,8 @@
 """drone-log PWA 用 BFF.
 
 `POST /api/parse-log` で DJI の `.txt` ログをバイナリ解析し、PWA が使う
-日付・離着陸時刻（JST）・飛行時間・離陸地点を返す。
+日付・離着陸時刻（JST）・飛行時間・離陸地点を返す。`POST /api/export-log` では
+様式1の Excel テンプレートへ入力を書き込み、オンメモリで `.xlsx` を返す。
 
 解析には `pydjirecord` を使う。DJI の内部時刻は UTC で記録されるため、
 レスポンスは必ず JST（UTC+9）へ変換する。v13 以降のフレーム（GPS 軌跡）は
@@ -15,12 +16,18 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
+from openpyxl import load_workbook
+from pydantic import BaseModel, Field
 from pydjirecord import DJILog
 
 SERVICE_NAME = "drone-log-bff"
@@ -31,6 +38,13 @@ JST = timezone(timedelta(hours=9), name="JST")
 # 異常値を弾くための下限・上限。DJI の飛行ログは通常この範囲に収まる。
 MIN_LOG_YEAR = 2000
 MAX_FLIGHT_SECONDS = 24 * 60 * 60
+
+# 国交省様式1の飛行日誌テンプレート。セル番地はテンプレート側のレイアウトに
+# 合わせてあり、変更する場合は README の対応表も更新すること。
+TEMPLATE_PATH = Path(__file__).resolve().parent / "template" / "flight_record_template.xlsx"
+EXCEL_MEDIA_TYPE = (
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+)
 
 logger = logging.getLogger(SERVICE_NAME)
 logging.basicConfig(
@@ -43,9 +57,9 @@ app = FastAPI(
     description=(
         "ドローン飛行日誌 PWA のバックエンド。"
         "DJI の .txt ログをバイナリ解析し、JST の離着陸時刻・飛行時間・"
-        "離陸地点を返します。"
+        "離陸地点を返します。飛行日誌の Excel（様式1）も生成できます。"
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 # プロトタイプ用の CORS 設定。PWA は cookie を使わないため credentials は無効。
@@ -56,9 +70,26 @@ app.add_middleware(
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    # PWA がダウンロード時のファイル名を参照できるようにする。
+    expose_headers=["Content-Disposition"],
 )
 
 Coordinates = tuple[float, float]
+
+
+class FlightRecord(BaseModel):
+    """飛行日誌（Excel）へ書き出す 1 飛行分の入力。"""
+
+    date: str = Field(..., max_length=32, description="飛行年月日（YYYY-MM-DD）")
+    operator_name: str = Field(..., max_length=120, description="操縦者氏名")
+    registration_id: str = Field(..., max_length=64, description="機体登録記号")
+    purpose: str = Field(..., max_length=120, description="飛行目的")
+    location: str = Field(..., max_length=240, description="離陸場所")
+    takeoff_time: str = Field(..., max_length=16, description="離陸時刻（HH:MM）")
+    landing_time: str = Field(..., max_length=16, description="着陸時刻（HH:MM）")
+    total_time: str = Field(..., max_length=32, description="飛行時間（表示用）")
+    safety_measures: str = Field("", max_length=500, description="安全対策")
+    notes: str = Field("", max_length=1000, description="備考")
 
 
 @dataclass(frozen=True)
@@ -343,3 +374,94 @@ async def parse_log(
         meta["mode"],
     )
     return _to_response(filename, summary)
+
+
+def _excel_filename(date_value: str) -> str:
+    """Content-Disposition 用の安全な ASCII ファイル名を組み立てる。"""
+
+    safe_date = re.sub(r"[^0-9A-Za-z._-]+", "_", date_value).strip("._")
+    return f"flight_record_{safe_date or 'unknown'}.xlsx"
+
+
+@app.post(
+    "/api/export-log",
+    response_class=StreamingResponse,
+    responses={
+        200: {
+            "content": {EXCEL_MEDIA_TYPE: {}},
+            "description": "飛行日誌の Excel ファイル",
+        },
+        422: {"description": "入力値の検証エラー"},
+        500: {"description": "テンプレート読み込み・Excel 生成エラー"},
+    },
+)
+def export_log(record: FlightRecord) -> StreamingResponse:
+    """飛行日誌テンプレートへ入力を書き込み、Excel を返す。
+
+    生成物は `io.BytesIO` 上で完結させ、ディスクへは保存しない。セル番地は
+    テンプレートの仮レイアウトに合わせたもので、将来変更する可能性がある。
+    """
+
+    if not TEMPLATE_PATH.is_file():
+        logger.error("export-log template missing: %s", TEMPLATE_PATH)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "template_missing",
+                "message": "飛行日誌テンプレートが見つかりません。",
+            },
+        )
+
+    workbook = None
+    buffer = BytesIO()
+    try:
+        workbook = load_workbook(TEMPLATE_PATH)
+        sheet = workbook.active
+
+        # テンプレート側のラベルと対応する仮のセル番地。
+        sheet["B2"] = record.date
+        sheet["D2"] = record.operator_name
+        sheet["B4"] = record.registration_id
+        sheet["D4"] = record.purpose
+        sheet["B6"] = record.location
+        sheet["D6"] = record.takeoff_time
+        sheet["F6"] = record.landing_time
+        sheet["H6"] = record.total_time
+        sheet["B8"] = record.safety_measures
+        sheet["B10"] = record.notes
+
+        workbook.save(buffer)
+    except Exception as exc:  # noqa: BLE001 - 例外詳細はクライアントへ返さない
+        logger.exception(
+            "export-log failed: date=%s template=%s",
+            record.date,
+            TEMPLATE_PATH,
+        )
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "code": "excel_export_failed",
+                "message": "飛行日誌の生成に失敗しました。",
+            },
+        ) from exc
+    finally:
+        if workbook is not None:
+            workbook.close()
+
+    buffer.seek(0)
+    filename = _excel_filename(record.date)
+    logger.info(
+        "export-log generated: date=%s filename=%s bytes=%d",
+        record.date,
+        filename,
+        buffer.getbuffer().nbytes,
+    )
+
+    return StreamingResponse(
+        buffer,
+        media_type=EXCEL_MEDIA_TYPE,
+        headers={
+            "Content-Disposition": f'attachment; filename="{filename}"',
+            "Content-Length": str(buffer.getbuffer().nbytes),
+        },
+    )

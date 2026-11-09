@@ -1,0 +1,12 @@
+{
+  "date": "2026-11-08",
+  "operator_name": "普施 太郎",
+  "registration_id": "JU1234567890",
+  "purpose": "空撮",
+  "location": "テスト飛行場",
+  "takeoff_time": "10:00",
+  "landing_time": "10:15",
+  "total_time": "15分",
+  "safety_measures": "立入管理措置: 講じる / 飛行前点検: 全項目OK",
+  "notes": "スモークテスト"
+}

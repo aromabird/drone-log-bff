@@ -7,6 +7,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SAMPLE="$ROOT_DIR/tests/sample_dji.txt"
 MINIMAL="$ROOT_DIR/tests/fixtures/minimal_v14.txt"
 INVALID="$ROOT_DIR/tests/invalid_dji.txt"
+EXPORT_JSON="$ROOT_DIR/tests/export_sample.json"
 PYTHON="$ROOT_DIR/.venv/bin/python"
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -15,7 +16,7 @@ if [ ! -x "$PYTHON" ]; then
   echo "ERROR: $PYTHON が見つかりません。先に .venv を作成してください。" >&2
   exit 1
 fi
-for path in "$SAMPLE" "$MINIMAL" "$INVALID"; do
+for path in "$SAMPLE" "$MINIMAL" "$INVALID" "$EXPORT_JSON"; do
   if [ ! -f "$path" ]; then
     echo "ERROR: $path が見つかりません。" >&2
     exit 1
@@ -159,5 +160,50 @@ if ! grep -qi '^access-control-allow-methods:.*POST' "$TMP_DIR/cors.txt"; then
   exit 1
 fi
 echo "   CORS OK"
+
+echo "8) export-log Excel"
+curl -fsS --max-time 15 -D "$TMP_DIR/export-headers.txt" \
+  -X POST \
+  -H "Content-Type: application/json" \
+  --data-binary @"$EXPORT_JSON" \
+  "$BASE_URL/api/export-log" \
+  -o "$TMP_DIR/flight_record.xlsx"
+
+if ! grep -qi '^content-type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' "$TMP_DIR/export-headers.txt"; then
+  echo "ERROR: Excel の Content-Type が不正です。" >&2
+  cat "$TMP_DIR/export-headers.txt" >&2
+  exit 1
+fi
+if ! grep -qi '^content-disposition: attachment; filename="flight_record_2026-11-08.xlsx"' "$TMP_DIR/export-headers.txt"; then
+  echo "ERROR: Content-Disposition が不正です。" >&2
+  cat "$TMP_DIR/export-headers.txt" >&2
+  exit 1
+fi
+"$PYTHON" - "$TMP_DIR/flight_record.xlsx" <<'PY'
+import sys
+
+from openpyxl import load_workbook
+
+path = sys.argv[1]
+workbook = load_workbook(path)
+sheet = workbook.active
+expected = {
+    "B2": "2026-11-08",
+    "D2": "普施 太郎",
+    "B4": "JU1234567890",
+    "D4": "空撮",
+    "B6": "テスト飛行場",
+    "D6": "10:00",
+    "F6": "10:15",
+    "H6": "15分",
+    "B8": "立入管理措置: 講じる / 飛行前点検: 全項目OK",
+    "B10": "スモークテスト",
+}
+for cell, value in expected.items():
+    actual = sheet[cell].value
+    assert actual == value, f"{cell}: expected {value!r}, got {actual!r}"
+workbook.close()
+print("   export-log OK:", path)
+PY
 
 echo "ALL TESTS PASSED"

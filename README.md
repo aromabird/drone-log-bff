@@ -5,6 +5,10 @@
 [`pydjirecord`](https://github.com/rembish/pydjirecord) でバイナリ解析して、
 PWA がそのまま使える飛行サマリー JSON を返します。
 
+さらに `POST /api/export-log` で、国交省「無人航空機の飛行日誌の取扱要領」様式1に
+準拠した Excel テンプレートへ入力を書き込み、`openpyxl` + `io.BytesIO` で
+オンメモリ生成した `.xlsx` を返します（ディスクへは保存しません）。
+
 DJI の内部時刻は UTC で記録されるため、日付・離着陸時刻は必ず JST（UTC+9）へ
 変換して返します。アップロードされた内容はメモリ上で読み捨て、ディスクへ
 保存しません。
@@ -109,6 +113,64 @@ curl -sS -D - \
   http://127.0.0.1:8000/api/parse-log
 ```
 
+### `POST /api/export-log`
+
+- Content-Type: `application/json`
+- 成功時: `200` + Excel ファイル
+  - `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`
+  - `Content-Disposition: attachment; filename="flight_record_{date}.xlsx"`
+- 入力不備: `422`（FastAPI 標準）
+- テンプレート欠落・生成失敗: `500` + エラーコード
+
+リクエスト例:
+
+```json
+{
+  "date": "2026-11-08",
+  "operator_name": "普施 太郎",
+  "registration_id": "JU1234567890",
+  "purpose": "空撮",
+  "location": "千葉県香取市小見川",
+  "takeoff_time": "10:00",
+  "landing_time": "10:15",
+  "total_time": "15分",
+  "safety_measures": "立入管理措置: 講じる / 飛行前点検: 全項目OK",
+  "notes": "スモークテスト"
+}
+```
+
+```bash
+curl -sS -D flight_record_headers.txt \
+  -X POST \
+  -H "Content-Type: application/json" \
+  --data-binary @tests/export_sample.json \
+  http://127.0.0.1:8000/api/export-log \
+  -o flight_record.xlsx
+```
+
+セル番地はテンプレートの仮レイアウトです。帳票の正式なセル位置が決まったら、
+`main.py` の書き込み先と `template/flight_record_template.xlsx` を合わせて変更してください。
+
+| セル | 項目 | リクエストフィールド |
+|---|---|---|
+| B2 | 飛行年月日 | `date` |
+| D2 | 操縦者氏名 | `operator_name` |
+| B4 | 機体登録記号 | `registration_id` |
+| D4 | 飛行目的 | `purpose` |
+| B6 | 離陸場所 | `location` |
+| D6 | 離陸時刻 | `takeoff_time` |
+| F6 | 着陸時刻 | `landing_time` |
+| H6 | 飛行時間 | `total_time` |
+| B8 | 安全対策 | `safety_measures` |
+| B10 | 備考 | `notes` |
+
+`date` はファイル名にも使います。ファイル名に使えない文字は `_` に置換します。
+Excel は `io.BytesIO` 上で生成し、レスポンス後はディスクに残りません。
+
+`tests/export_sample.json` はスモークテストで使うサンプルです。手元で curl を
+試す場合は、同じ内容の JSON ファイルを用意するか、`--data-binary` のパスを
+`tests/export_sample.json` に合わせてください。
+
 ## 解析仕様
 
 - **日時**: `Details.start_time`（UTC aware）を JST に変換。`date` は離陸日。
@@ -149,6 +211,7 @@ cd drone-log-bff
 5. DJI ログでない `.txt` の安全側エラー（422 / `dji_log_unreadable`）
 6. `file` 未指定（422）
 7. CORS プリフライト
+8. 飛行日誌 Excel の生成（セル値・Content-Type・ファイル名）
 
 ## CORS
 
@@ -164,9 +227,12 @@ drone-log-bff/
 ├── requirements.txt
 ├── .gitignore
 ├── README.md
+├── template/
+│   └── flight_record_template.xlsx  # 様式1のExcelテンプレート（仮セル番地）
 └── tests/
     ├── sample_dji.txt          # 実ログ v4（Details フォールバック検証）
     ├── invalid_dji.txt         # 解析失敗の検証
+    ├── export_sample.json      # export-log のリクエスト例
     ├── smoke_test.sh
     └── fixtures/
         ├── README.md           # 出典・ライセンス・期待値
