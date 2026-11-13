@@ -33,7 +33,6 @@ from fastapi.responses import StreamingResponse
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from pydjirecord import DJILog
-from starlette.datastructures import Headers, MutableHeaders
 
 SERVICE_NAME = "drone-log-bff"
 
@@ -98,43 +97,6 @@ CORS_ALLOW_ORIGIN_REGEX = (
     r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}"
     r")(?::\d+)?$"
 )
-CORS_ORIGIN_RE = re.compile(CORS_ALLOW_ORIGIN_REGEX)
-
-
-class PrivateNetworkAccessMiddleware:
-    """Chrome の Private Network Access (PNA) を許可する。
-
-    公開 HTTPS の PWA（https://aromabird.github.io）から Tailscale の
-    100.64.0.0/10 へ fetch すると、Chrome は「local address space」への
-    アクセスとして PNA プリフライトを送る。CORS の許可に加えて
-    ``Access-Control-Allow-Private-Network: true`` を返さないと遮断される。
-    許可オリジン以外にはヘッダを付けない（CORS の許可リストと同一）。
-    """
-
-    def __init__(self, app):
-        self.app = app
-
-    async def __call__(self, scope, receive, send):
-        if scope.get("type") != "http":
-            await self.app(scope, receive, send)
-            return
-
-        headers = Headers(scope=scope)
-        origin = headers.get("origin", "")
-        allowed = origin in CORS_ALLOW_ORIGINS or bool(CORS_ORIGIN_RE.match(origin))
-        if not allowed:
-            await self.app(scope, receive, send)
-            return
-
-        async def send_with_pna(message):
-            if message["type"] == "http.response.start":
-                MutableHeaders(scope=message)[
-                    "Access-Control-Allow-Private-Network"
-                ] = "true"
-            await send(message)
-
-        await self.app(scope, receive, send_with_pna)
-
 
 # 本番の bind は launchd（com.aromabird.drone-log-bff.plist）が
 # `--host 0.0.0.0 --port 8000` を指定する。Tailscale の HTTPS は
@@ -144,6 +106,9 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ALLOW_ORIGINS,
     allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,
+    # Chrome の Private Network Access (PNA)。公開 HTTPS の PWA から
+    # Tailscale の 100.64.0.0/10 へアクセスするために必要。
+    allow_private_network=True,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -151,8 +116,6 @@ app.add_middleware(
     # PWA がダウンロード時のファイル名を参照できるようにする。
     expose_headers=["Content-Disposition"],
 )
-# CORS の外側で PNA ヘッダを付与する（最後に追加したミドルウェアが最外層）。
-app.add_middleware(PrivateNetworkAccessMiddleware)
 
 Coordinates = tuple[float, float]
 

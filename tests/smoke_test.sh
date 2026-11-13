@@ -190,22 +190,32 @@ fi
 
 # Chrome の Private Network Access (PNA): 公開 HTTPS から Tailscale IP へ
 # アクセスするには Access-Control-Allow-Private-Network: true が必要。
-curl -sS --max-time 10 -D "$TMP_DIR/pna.txt" -o /dev/null -X OPTIONS \
+PNA_STATUS="$(curl -sS --max-time 10 -D "$TMP_DIR/pna.txt" -o /dev/null -w '%{http_code}' -X OPTIONS \
   -H "Origin: https://aromabird.github.io" \
   -H "Access-Control-Request-Method: GET" \
   -H "Access-Control-Request-Private-Network: true" \
-  "$BASE_URL/api/health"
+  "$BASE_URL/api/health")"
+if [ "$PNA_STATUS" != "200" ]; then
+  echo "ERROR: PNA プリフライトは 200 を期待しましたが $PNA_STATUS でした。" >&2
+  cat "$TMP_DIR/pna.txt" >&2
+  exit 1
+fi
 if ! grep -qi '^access-control-allow-private-network: true' "$TMP_DIR/pna.txt"; then
   echo "ERROR: Private Network Access ヘッダがありません。" >&2
   cat "$TMP_DIR/pna.txt" >&2
   exit 1
 fi
 # 許可外オリジンには PNA ヘッダを付けない。
-curl -sS --max-time 10 -D "$TMP_DIR/pna-deny.txt" -o /dev/null -X OPTIONS \
+PNA_DENY_STATUS="$(curl -sS --max-time 10 -D "$TMP_DIR/pna-deny.txt" -o /dev/null -w '%{http_code}' -X OPTIONS \
   -H "Origin: https://example.com" \
   -H "Access-Control-Request-Method: GET" \
   -H "Access-Control-Request-Private-Network: true" \
-  "$BASE_URL/api/health"
+  "$BASE_URL/api/health")"
+if [ "$PNA_DENY_STATUS" != "400" ]; then
+  echo "ERROR: 許可外オリジンの PNA プリフライトは 400 を期待しましたが $PNA_DENY_STATUS でした。" >&2
+  cat "$TMP_DIR/pna-deny.txt" >&2
+  exit 1
+fi
 if grep -qi '^access-control-allow-private-network:' "$TMP_DIR/pna-deny.txt"; then
   echo "ERROR: 許可外オリジンに PNA ヘッダが返されています。" >&2
   cat "$TMP_DIR/pna-deny.txt" >&2

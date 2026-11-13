@@ -324,9 +324,9 @@ Overpass が混雑している場合は、OSM API フォールバックにより
 - **Chrome の Private Network Access (PNA)**: 公開 HTTPS の
   `https://aromabird.github.io` から Tailscale の `100.64.0.0/10` へ fetch すると、
   Chrome は「local address space」へのアクセスとして追加のプリフライトを送ります。
-  本 BFF は許可オリジンに対して `Access-Control-Allow-Private-Network: true` を
-  返すため、PWA からそのまま利用できます（`PrivateNetworkAccessMiddleware`）。
-  このヘッダが無いと `Failed to fetch` になります。
+  本 BFF は `CORSMiddleware(allow_private_network=True)` により、許可オリジンへ
+  `Access-Control-Allow-Private-Network: true` を返します（プリフライトは 200）。
+  この設定が無いと PWA は `Failed to fetch` になります。
 
 ## ファイル構成
 
