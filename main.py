@@ -14,6 +14,8 @@ DJI の API キーが必要だが、Details（日時・座標・飛行時間）�
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
 import math
 import os
@@ -27,9 +29,9 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from fastapi import FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from openpyxl import load_workbook
 from pydantic import BaseModel, Field
 from pydjirecord import DJILog
@@ -49,6 +51,20 @@ TEMPLATE_PATH = Path(__file__).resolve().parent / "template" / "flight_record_te
 EXCEL_MEDIA_TYPE = (
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 )
+
+# PWA の localStorage バックアップ。data/ は .gitignore 対象で、ファイルには
+# 操縦者名・技能証明番号・連絡先などの個人情報が含まれるため 0600 で保存する。
+# テスト時に保存先を切り替えられるよう環境変数で上書きできる。
+DATA_DIR = Path(
+    os.getenv(
+        "DRONE_LOG_DATA_DIR",
+        str(Path(__file__).resolve().parent / "data"),
+    )
+).expanduser()
+BACKUP_PATH = DATA_DIR / "backup.json"
+BACKUP_TMP_PATH = DATA_DIR / "backup.json.tmp"
+MAX_BACKUP_BYTES = 10 * 1024 * 1024
+BACKUP_LOCK = asyncio.Lock()
 
 # 周辺インフラ（送電線・鉄塔）の取得先。環境変数で上書きできる。
 OVERPASS_API_URL = os.getenv(
@@ -80,7 +96,7 @@ app = FastAPI(
         "離陸地点を返します。飛行日誌の Excel（様式1）も生成できます。"
         "周辺の送電線・鉄塔は Overpass API から取得します。"
     ),
-    version="0.3.2",
+    version="0.4.0",
 )
 
 # CORS は「PWA の配信元」と「ローカル開発」だけに限定する。
@@ -683,6 +699,84 @@ def _fetch_osm_api_counts(lat: float, lon: float, radius: int) -> tuple[int, int
 async def health() -> dict[str, str]:
     """起動確認用のヘルスチェック。"""
     return {"status": "ok", "service": SERVICE_NAME}
+
+
+@app.post("/api/backup")
+async def save_backup(request: Request) -> dict[str, Any]:
+    """PWA の localStorage バックアップを ``data/backup.json`` に保存する。
+
+    クライアントから受け取った JSON をそのまま（再シリアライズせず）書き込む。
+    個人情報を含むため、ディレクトリは 0700、ファイルは 0600 にする。
+    """
+    body = await request.body()
+    if not body:
+        raise HTTPException(status_code=400, detail="バックアップデータが空です。")
+    if len(body) > MAX_BACKUP_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail="バックアップが大きすぎます（上限10MB）。",
+        )
+
+    try:
+        payload = json.loads(body)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="JSONの形式が正しくありません。",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=400,
+            detail="バックアップはJSONオブジェクトで送信してください。",
+        )
+
+    try:
+        async with BACKUP_LOCK:
+            DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chmod(DATA_DIR, 0o700)
+            BACKUP_TMP_PATH.write_bytes(body)
+            os.chmod(BACKUP_TMP_PATH, 0o600)
+            BACKUP_TMP_PATH.replace(BACKUP_PATH)
+    except OSError as exc:
+        logger.exception("failed to save backup: %s", BACKUP_PATH)
+        raise HTTPException(
+            status_code=500,
+            detail="バックアップを保存できませんでした。",
+        ) from exc
+    finally:
+        if BACKUP_TMP_PATH.exists():
+            try:
+                BACKUP_TMP_PATH.unlink()
+            except OSError:
+                pass
+
+    saved_at = datetime.now(JST).isoformat(timespec="seconds")
+    logger.info("backup saved: %s (%d bytes)", BACKUP_PATH, len(body))
+    return {"ok": True, "bytes": len(body), "savedAt": saved_at}
+
+
+@app.get("/api/backup")
+async def get_backup() -> JSONResponse:
+    """``data/backup.json`` を返す。ファイルが無い場合は空オブジェクト。"""
+    if not BACKUP_PATH.is_file():
+        return JSONResponse(content={}, headers={"Cache-Control": "no-store"})
+
+    try:
+        raw = BACKUP_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.exception("failed to read backup: %s", BACKUP_PATH)
+        raise HTTPException(
+            status_code=500,
+            detail="バックアップを読み込めませんでした。",
+        ) from exc
+
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=500,
+            detail="バックアップの形式が不正です。",
+        )
+    return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
 
 
 @app.get(

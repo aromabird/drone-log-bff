@@ -105,6 +105,29 @@ export DJI_API_KEY="<DJI Developer API Key>"
 {"status": "ok", "service": "drone-log-bff"}
 ```
 
+### `GET /api/backup` / `POST /api/backup`
+
+PWA の設定タブ「データの手動同期」が使うバックアップAPIです。
+
+- `POST /api/backup`
+  - リクエストボディの JSON オブジェクトを `data/backup.json` に**そのまま**保存します。
+  - 最大 10MB。空ボディ・不正 JSON・配列は `400`、10MB 超は `413`。
+  - 成功レスポンス例: `{"ok": true, "bytes": 644, "savedAt": "2026-11-13T22:40:09+09:00"}`
+- `GET /api/backup`
+  - `data/backup.json` を返します。ファイルが無い場合は `{}`。
+  - `Cache-Control: no-store` を付けます。
+
+```bash
+curl -sS http://127.0.0.1:8000/api/backup
+curl -sS -X POST -H 'Content-Type: application/json' \
+  --data-binary '{"drone-log:last-pilot":"PLT-0001"}' \
+  http://127.0.0.1:8000/api/backup
+```
+
+- 保存先は環境変数 `DRONE_LOG_DATA_DIR`（既定: `./data`）で変更できます。
+- `data/` は `.gitignore` 対象です。ディレクトリは `0700`、`backup.json` は `0600` で作成します。
+- 操縦者名・技能証明番号・連絡先などの個人情報を含むため、BFF を一般公開しないでください。
+
 ### `GET /api/check-infrastructure`
 
 指定座標から半径 `radius` メートル以内の `power=tower`（鉄塔）と
@@ -305,6 +328,25 @@ cd drone-log-bff
 Overpass が混雑している場合は、OSM API フォールバックにより 20〜40 秒ほど
 かかることがあります。
 
+### バックアップAPIのテスト
+
+`tests/backup_test.sh` は、本番の `data/backup.json` を壊さないよう
+一時ディレクトリを `DRONE_LOG_DATA_DIR` に指定し、別ポート（既定: 8011）で
+BFF を起動して検証します。
+
+```bash
+cd drone-log-bff
+./tests/backup_test.sh
+```
+
+1. ファイル無しの `GET` → `{}`
+2. `POST` → `200`、送信した生JSONと保存ファイルが一致
+3. `GET` → `POST` したJSONと一致、`Cache-Control: no-store`
+4. パーミッション（`data/` = 700、`backup.json` = 600）
+5. 不正JSON・配列は `400`、既存バックアップは保持
+
+最後に `ALL BACKUP TESTS PASSED` を表示します。
+
 ## CORS
 
 `allow_credentials=False`（cookie を使わない）のうえで、以下のオリジンだけを許可します。
@@ -342,11 +384,14 @@ drone-log-bff/
 ├── README.md
 ├── template/
 │   └── flight_record_template.xlsx  # 国交省様式1の公式Excelテンプレート
+├── data/                      # 実行時に自動作成（.gitignore / 0700）
+│   └── backup.json            # PWAのlocalStorageバックアップ（0600）
 └── tests/
     ├── sample_dji.txt          # 実ログ v4（Details フォールバック検証）
     ├── invalid_dji.txt         # 解析失敗の検証
     ├── export_sample.json      # export-log のリクエスト例
     ├── smoke_test.sh
+    ├── backup_test.sh          # バックアップAPI（一時データディレクトリ）
     └── fixtures/
         ├── README.md           # 出典・ライセンス・期待値
         └── minimal_v14.txt     # v14 最小ログ（Details 復号検証）
