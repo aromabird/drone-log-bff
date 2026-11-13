@@ -216,8 +216,10 @@ if [ "$PNA_DENY_STATUS" != "400" ]; then
   cat "$TMP_DIR/pna-deny.txt" >&2
   exit 1
 fi
-if grep -qi '^access-control-allow-private-network:' "$TMP_DIR/pna-deny.txt"; then
-  echo "ERROR: 許可外オリジンに PNA ヘッダが返されています。" >&2
+# Starlette は許可外オリジンでも PNA ヘッダを付けるが、ACAO を返さないため
+# ブラウザは拒否する。ここでは ACAO が無いことを確認する。
+if grep -qi '^access-control-allow-origin:' "$TMP_DIR/pna-deny.txt"; then
+  echo "ERROR: 許可外オリジンに ACAO が返されています。" >&2
   cat "$TMP_DIR/pna-deny.txt" >&2
   exit 1
 fi

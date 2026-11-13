@@ -327,6 +327,10 @@ Overpass が混雑している場合は、OSM API フォールバックにより
   本 BFF は `CORSMiddleware(allow_private_network=True)` により、許可オリジンへ
   `Access-Control-Allow-Private-Network: true` を返します（プリフライトは 200）。
   この設定が無いと PWA は `Failed to fetch` になります。
+- Chrome 142 以降の **Local Network Access (LNA)** では、公開 HTTPS ページから
+  ローカルネットワークへ接続する際に**ユーザーの許可プロンプト**が表示されます。
+  ヘッダだけでは権限は付与されないため、初回は「許可」を選んでください。
+  Safari や `http://localhost` のローカルプレビューではプロンプトは出ません。
 
 ## ファイル構成
 
