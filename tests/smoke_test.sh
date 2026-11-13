@@ -143,14 +143,14 @@ if [ "$STATUS" != "422" ]; then
 fi
 echo "   missing file OK: 422"
 
-echo "7) CORS preflight"
+echo "7) CORS preflight (allowlist)"
 curl -sS --max-time 10 -D "$TMP_DIR/cors.txt" -o /dev/null -X OPTIONS \
   -H "Origin: http://localhost:8811" \
   -H "Access-Control-Request-Method: POST" \
   -H "Access-Control-Request-Headers: content-type" \
   "$BASE_URL/api/parse-log"
-if ! grep -qi '^access-control-allow-origin: \*' "$TMP_DIR/cors.txt"; then
-  echo "ERROR: access-control-allow-origin がありません。" >&2
+if ! grep -qi '^access-control-allow-origin: http://localhost:8811' "$TMP_DIR/cors.txt"; then
+  echo "ERROR: localhost オリジンが許可されていません。" >&2
   cat "$TMP_DIR/cors.txt" >&2
   exit 1
 fi
@@ -159,7 +159,35 @@ if ! grep -qi '^access-control-allow-methods:.*POST' "$TMP_DIR/cors.txt"; then
   cat "$TMP_DIR/cors.txt" >&2
   exit 1
 fi
-echo "   CORS OK"
+
+# GitHub Pages からのプリフライトも許可されること（本番 PWA のオリジン）。
+curl -sS --max-time 10 -D "$TMP_DIR/cors-pages.txt" -o /dev/null -X OPTIONS \
+  -H "Origin: https://aromabird.github.io" \
+  -H "Access-Control-Request-Method: POST" \
+  -H "Access-Control-Request-Headers: content-type" \
+  "$BASE_URL/api/parse-log"
+if ! grep -qi '^access-control-allow-origin: https://aromabird.github.io' "$TMP_DIR/cors-pages.txt"; then
+  echo "ERROR: https://aromabird.github.io が許可されていません。" >&2
+  cat "$TMP_DIR/cors-pages.txt" >&2
+  exit 1
+fi
+
+# 許可リスト外のオリジンには ACAO を返さないこと。
+STATUS="$(curl -sS --max-time 10 -D "$TMP_DIR/cors-deny.txt" -o /dev/null -w '%{http_code}' -X OPTIONS \
+  -H "Origin: https://example.com" \
+  -H "Access-Control-Request-Method: POST" \
+  "$BASE_URL/api/parse-log")"
+if grep -qi '^access-control-allow-origin:' "$TMP_DIR/cors-deny.txt"; then
+  echo "ERROR: 許可外オリジンに access-control-allow-origin が返されています。" >&2
+  cat "$TMP_DIR/cors-deny.txt" >&2
+  exit 1
+fi
+if [ "$STATUS" != "400" ]; then
+  echo "ERROR: 許可外オリジンのプリフライトは 400 を期待しましたが $STATUS でした。" >&2
+  cat "$TMP_DIR/cors-deny.txt" >&2
+  exit 1
+fi
+echo "   CORS OK (allowlist + deny)"
 
 echo "8) export-log Excel"
 curl -fsS --max-time 15 -D "$TMP_DIR/export-headers.txt" \

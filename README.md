@@ -32,16 +32,55 @@ cd drone-log-bff
 
 ## 起動
 
+ローカルだけで試す場合（この Mac のみ）:
+
 ```bash
 cd drone-log-bff
-.venv/bin/uvicorn main:app --reload --port 8000
+.venv/bin/uvicorn main:app --host 127.0.0.1 --port 8000
+```
+
+Tailscale や LAN の別端末から使う場合（本番と同じ）:
+
+```bash
+cd drone-log-bff
+.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 - API ドキュメント: <http://127.0.0.1:8000/docs>
 - ヘルスチェック: <http://127.0.0.1:8000/api/health>
+- 直 IP での確認（tailnet 内）: <http://100.113.102.38:8000/api/health>
 
-`uvicorn` の既定 bind は `127.0.0.1` です。iPhone など別端末から LAN 経由で
-試す場合は `--host 0.0.0.0` を付け、macOS のファイアウォールを確認してください。
+`uvicorn` の既定 bind は `127.0.0.1` です。`--host 0.0.0.0` を付けると
+macOS の全インターフェース（LAN / Tailscale）で待ち受けます。認証は無いため、
+macOS のファイアウォールと Tailscale の ACL で到達範囲を制御してください。
+
+### 本番運用（launchd + Tailscale）
+
+mac-mini-m4 では launchd の `com.aromabird.drone-log-bff` が起動を管理しています。
+
+```text
+~/Library/LaunchAgents/com.aromabird.drone-log-bff.plist
+  ProgramArguments: .venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
+  RunAtLoad: true / KeepAlive: true
+  StandardOutPath: /tmp/drone-log-bff.log
+  StandardErrorPath: /tmp/drone-log-bff.err
+```
+
+PWA は HTTPS で配信されるため、BFF も HTTPS でアクセスできる必要があります。
+`tailscale serve` が tailnet 内の HTTPS（443）を `127.0.0.1:8000` へプロキシします。
+
+```bash
+# 初回のみ（設定済みなら不要）
+tailscale serve --bg http://127.0.0.1:8000
+tailscale serve status
+
+# 例: https://mac-mini-m4.tail95f7a2.ts.net/api/health
+```
+
+- `tailscale serve` は **tailnet 内のみ**に公開します（一般インターネットには出ません）。
+- 認証が無いため `tailscale funnel` は使用しないでください。
+- HTTPS の PWA から `http://100.x.x.x:8000` を呼ぶと、ブラウザの混在コンテンツ
+  制限でブロックされます。PWA の設定タブには `https://…ts.net` を指定してください。
 
 ### v13 以降のフレーム（GPS 軌跡）を使う場合
 
@@ -52,7 +91,7 @@ v13 以降のログはフレームが暗号化されており、DJI の API キ�
 
 ```bash
 export DJI_API_KEY="<DJI Developer API Key>"
-.venv/bin/uvicorn main:app --reload --port 8000
+.venv/bin/uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 キーは DJI のキーチェーン取得 API に送信されます。ログやレスポンスには
@@ -257,7 +296,7 @@ cd drone-log-bff
 4. `.csv` の拒否（400）
 5. DJI ログでない `.txt` の安全側エラー（422 / `dji_log_unreadable`）
 6. `file` 未指定（422）
-7. CORS プリフライト
+7. CORS プリフライト（許可オリジンのエコー / 許可外オリジンの拒否）
 8. 飛行日誌 Excel の生成（セル値・Content-Type・ファイル名）
 9. 周辺インフラ API の入力バリデーション（緯度91 → 422）
 
@@ -268,9 +307,20 @@ Overpass が混雑している場合は、OSM API フォールバックにより
 
 ## CORS
 
-プロトタイプでは `allow_origins=["*"]`、`allow_credentials=False` で全オリジンを
-許可しています。PWA は cookie 認証を使わないため問題ありませんが、本番では
-`https://aromabird.github.io` とローカル開発用オリジンに限定してください。
+`allow_credentials=False`（cookie を使わない）のうえで、以下のオリジンだけを許可します。
+
+| 種別 | オリジン |
+|---|---|
+| 本番 PWA | `https://aromabird.github.io` |
+| 本番 HTTPS（tailnet） | `https://mac-mini-m4.tail95f7a2.ts.net` |
+| ローカル開発 | `http://localhost:<任意ポート>` / `http://127.0.0.1:<任意ポート>` / `http://[::1]:<任意ポート>` |
+| Tailscale IP | `http://100.64.0.0/10` の任意 IP・任意ポート |
+
+- `file://` で開いた場合（`Origin: null`）は許可されません。ローカル確認は
+  `python3 -m http.server` を使ってください。
+- 別の LAN IP（例: `http://192.168.1.20:8811`）から配信する場合は、
+  `main.py` の `CORS_ALLOW_ORIGIN_REGEX` にそのオリジンを追加してください。
+- 許可外オリジンのプリフライトは `400` を返し、`Access-Control-Allow-Origin` は付きません。
 
 ## ファイル構成
 

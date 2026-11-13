@@ -83,14 +83,32 @@ app = FastAPI(
     version="0.3.2",
 )
 
-# プロトタイプ用の CORS 設定。PWA は cookie を使わないため credentials は無効。
-# 本番では allow_origins を GitHub Pages とローカルオリジンに限定すること。
+# CORS は「PWA の配信元」と「ローカル開発」だけに限定する。
+# PWA は cookie を使わないため credentials は無効（allow_origins=["*"] にしない）。
+CORS_ALLOW_ORIGINS = [
+    "https://aromabird.github.io",
+    "https://mac-mini-m4.tail95f7a2.ts.net",
+]
+# localhost / 127.0.0.1 / [::1] と Tailscale の CGNAT 帯 (100.64.0.0/10) は
+# ポート番号を問わず許可する（`python3 -m http.server` の任意ポートに対応）。
+CORS_ALLOW_ORIGIN_REGEX = (
+    r"^https?://(?:"
+    r"localhost|127\.0\.0\.1|\[::1\]|"
+    r"100\.(?:6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d{1,3}\.\d{1,3}"
+    r")(?::\d+)?$"
+)
+# 本番の bind は launchd（com.aromabird.drone-log-bff.plist）が
+# `--host 0.0.0.0 --port 8000` を指定する。Tailscale の HTTPS は
+# `tailscale serve` が 443 → http://127.0.0.1:8000 へプロキシする。
+# 認証は無いため、Tailscale Funnel（一般公開）は使わないこと。
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_origin_regex=CORS_ALLOW_ORIGIN_REGEX,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
+    max_age=600,
     # PWA がダウンロード時のファイル名を参照できるようにする。
     expose_headers=["Content-Disposition"],
 )
