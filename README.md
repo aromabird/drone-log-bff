@@ -321,6 +321,12 @@ Overpass が混雑している場合は、OSM API フォールバックにより
 - 別の LAN IP（例: `http://192.168.1.20:8811`）から配信する場合は、
   `main.py` の `CORS_ALLOW_ORIGIN_REGEX` にそのオリジンを追加してください。
 - 許可外オリジンのプリフライトは `400` を返し、`Access-Control-Allow-Origin` は付きません。
+- **Chrome の Private Network Access (PNA)**: 公開 HTTPS の
+  `https://aromabird.github.io` から Tailscale の `100.64.0.0/10` へ fetch すると、
+  Chrome は「local address space」へのアクセスとして追加のプリフライトを送ります。
+  本 BFF は許可オリジンに対して `Access-Control-Allow-Private-Network: true` を
+  返すため、PWA からそのまま利用できます（`PrivateNetworkAccessMiddleware`）。
+  このヘッダが無いと `Failed to fetch` になります。
 
 ## ファイル構成
 

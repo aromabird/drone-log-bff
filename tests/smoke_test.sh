@@ -187,7 +187,31 @@ if [ "$STATUS" != "400" ]; then
   cat "$TMP_DIR/cors-deny.txt" >&2
   exit 1
 fi
-echo "   CORS OK (allowlist + deny)"
+
+# Chrome の Private Network Access (PNA): 公開 HTTPS から Tailscale IP へ
+# アクセスするには Access-Control-Allow-Private-Network: true が必要。
+curl -sS --max-time 10 -D "$TMP_DIR/pna.txt" -o /dev/null -X OPTIONS \
+  -H "Origin: https://aromabird.github.io" \
+  -H "Access-Control-Request-Method: GET" \
+  -H "Access-Control-Request-Private-Network: true" \
+  "$BASE_URL/api/health"
+if ! grep -qi '^access-control-allow-private-network: true' "$TMP_DIR/pna.txt"; then
+  echo "ERROR: Private Network Access ヘッダがありません。" >&2
+  cat "$TMP_DIR/pna.txt" >&2
+  exit 1
+fi
+# 許可外オリジンには PNA ヘッダを付けない。
+curl -sS --max-time 10 -D "$TMP_DIR/pna-deny.txt" -o /dev/null -X OPTIONS \
+  -H "Origin: https://example.com" \
+  -H "Access-Control-Request-Method: GET" \
+  -H "Access-Control-Request-Private-Network: true" \
+  "$BASE_URL/api/health"
+if grep -qi '^access-control-allow-private-network:' "$TMP_DIR/pna-deny.txt"; then
+  echo "ERROR: 許可外オリジンに PNA ヘッダが返されています。" >&2
+  cat "$TMP_DIR/pna-deny.txt" >&2
+  exit 1
+fi
+echo "   CORS OK (allowlist + deny + PNA)"
 
 echo "8) export-log Excel"
 curl -fsS --max-time 15 -D "$TMP_DIR/export-headers.txt" \
