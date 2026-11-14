@@ -12,6 +12,10 @@ PWA がそのまま使える飛行サマリー JSON を返します。
 `GET /api/check-infrastructure` では、指定座標の周辺にある送電線・鉄塔を
 Overpass API（OpenStreetMap）から取得し、PWA のリスク判定用 JSON を返します。
 
+`GET /api/reverse-geocode` では、指定座標の日本の住所を Google Maps Geocoding API
+から取得し、「日本、〒…」を除いた住所文字列を返します。キーは BFF の `.env` だけで
+管理します。
+
 `POST /api/diagnose` では、飛行計画・気象・標高・DID・周辺インフラ・機体情報と
 任意の現場写真から、Gemini API で飛行前の安全診断文を生成します。API キーは
 BFF の環境変数（`.env`）だけで管理し、ブラウザへは渡しません。
@@ -122,12 +126,67 @@ GEMINI_MODEL=gemini-3.5-flash-lite   # 任意（既定値も同じ）
   PWA 側で写真は長辺 1200px、地図は表示中の領域（`html2canvas`・2倍解像度）を
   JPEG に変換し、BFF は base64 をそのまま Gemini へ渡します（ディスクへは保存しません）。
 
+### 逆ジオコーディング（Google Maps Geocoding API）の設定
+
+`GET /api/reverse-geocode` は Google Maps Geocoding API（`language=ja`）を REST で呼びます。
+
+```bash
+# drone-log-bff/.env（Git 管理外・パーミッション 600）
+GOOGLE_MAPS_API_KEY=<Google Cloud で発行した API キー>
+```
+
+- Google Cloud Console で **Geocoding API** を有効化したプロジェクトのキーを使ってください。
+- キーに API 制限をかける場合は **Geocoding API** を許可します。サーバーからの呼び出しなので
+  HTTP リファラー制限は使えません（IP 制限を使う場合はこの Mac の固定 IP が必要です）。
+- `.env` を変更したら BFF を再起動してください（launchd なら `launchctl kickstart`）。
+- 未設定でも BFF は起動し、`/api/reverse-geocode` だけが
+  `503 {"detail": {"code": "geocode_not_configured", ...}}` を返します。
+- キーはレスポンス・ログ・PWA へ出しません。ログは `座標 / 住所の文字数 / 処理時間` のみです。
+- 上流の `status` は HTTP ステータスへ変換します（`ZERO_RESULTS`→404、
+  `OVER_QUERY_LIMIT`→503、`REQUEST_DENIED`→503、`INVALID_REQUEST`→502、タイムアウト→504）。
+- PWA 側は BFF が失敗したとき、国土地理院の逆ジオコーダー（市区町村名）へフォールバックします。
+
 ## API
 
 ### `GET /api/health`
 
 ```json
 {"status": "ok", "service": "drone-log-bff"}
+```
+
+### `GET /api/reverse-geocode`
+
+緯度・経度から日本の住所を返します（PWA の GPS ボタン・座標検索・貼り付け変換が使用）。
+
+- クエリパラメータ
+  - `lat`（必須）: 緯度 `-90.0`〜`90.0`
+  - `lng`（必須）: 経度 `-180.0`〜`180.0`
+- 成功時: `200`
+
+```json
+{
+  "ok": true,
+  "address": "東京都千代田区丸の内１丁目",
+  "formatted_address": "日本、〒100-0005 東京都千代田区丸の内１丁目",
+  "lat": 35.681236,
+  "lng": 139.767125,
+  "place_id": "ChIJ...",
+  "source": "google",
+  "fetched_at": "2026-11-14T18:40:00+09:00"
+}
+```
+
+- `address` は `formatted_address` から「日本」「〒xxx-xxxx」を除いた文字列です。
+- エラーは `{"detail": {"code": "...", "message": "..."}}` 形式です。
+  - `503 geocode_not_configured`: `.env` に `GOOGLE_MAPS_API_KEY` が無い
+  - `503 geocode_auth_error`: `REQUEST_DENIED`（API 無効・キー制限など）
+  - `503 geocode_rate_limited`: `OVER_QUERY_LIMIT` / `OVER_DAILY_LIMIT`
+  - `404 geocode_not_found`: `ZERO_RESULTS`
+  - `502 geocode_invalid_request` / `geocode_invalid_response` / `geocode_upstream_error`
+  - `504 geocode_timeout`
+
+```bash
+curl -sS 'http://127.0.0.1:8000/api/reverse-geocode?lat=35.681236&lng=139.767125'
 ```
 
 ### `GET /api/backup` / `POST /api/backup`

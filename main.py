@@ -93,6 +93,16 @@ MAX_DIAGNOSIS_PROMPT_CHARS = 6000
 # 生成文が想定より長くなった場合の表示上限。
 MAX_DIAGNOSIS_TEXT_CHARS = 2000
 
+# 逆ジオコーディング（Google Maps Geocoding API）。
+#
+# PWA の「現在地（GPS）」「座標から地名を取得」「緯度経度の貼り付け」で使う。
+# キーは BFF の .env からのみ読み、レスポンス・ログ・PWA へは出さない。
+# 未設定でも BFF は起動し、エンドポイントだけが 503 geocode_not_configured を返す。
+GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
+# 接続5秒・応答8秒。PWA 側は12秒で打ち切るため、BFF が先にタイムアウトを返す。
+GOOGLE_GEOCODE_TIMEOUT = (5.0, 8.0)
+
 # 周辺インフラ（送電線・鉄塔）の取得設定。
 #
 # Overpass API は混雑・クォータ超過（406/429）で無応答になることが多く、
@@ -950,6 +960,238 @@ def check_infrastructure(
         message=message,
         source=source,
         elapsed_ms=elapsed_ms,
+    )
+
+
+class ReverseGeocodeResult(BaseModel):
+    """`GET /api/reverse-geocode` のレスポンス。"""
+
+    ok: bool = True
+    address: str
+    formatted_address: str
+    lat: float
+    lng: float
+    place_id: str | None = None
+    source: str = "google"
+    fetched_at: str
+
+
+# Google の formatted_address は「日本、〒100-0005 東京都千代田区丸の内１丁目」の形で
+# 返る。PWA の離陸場所欄には日本の住所だけを入れるため、国名と郵便番号を落とす。
+_JAPAN_ADDRESS_PREFIX = re.compile(r"^\s*(?:日本|Japan)\s*[、,]\s*", re.IGNORECASE)
+_JAPAN_ADDRESS_SUFFIX = re.compile(r"\s*[、,]\s*(?:日本|Japan)\s*$", re.IGNORECASE)
+_JAPAN_POSTAL_CODE = re.compile(r"〒\s*\d{3}\s*-\s*\d{4}\s*")
+
+# Google の status と HTTP ステータスの対応。UNKNOWN_ERROR などは 502 にまとめる。
+_GEOCODE_STATUS_ERRORS: dict[str, tuple[int, str, str]] = {
+    "ZERO_RESULTS": (404, "geocode_not_found", "この座標の住所が見つかりませんでした。"),
+    "OVER_QUERY_LIMIT": (
+        503,
+        "geocode_rate_limited",
+        "住所検索の利用上限に達しました。時間をおいて再試行してください。",
+    ),
+    "OVER_DAILY_LIMIT": (
+        503,
+        "geocode_rate_limited",
+        "住所検索の利用上限に達しました。時間をおいて再試行してください。",
+    ),
+    "REQUEST_DENIED": (
+        503,
+        "geocode_auth_error",
+        "住所検索の認証に失敗しました。サーバーの設定を確認してください。",
+    ),
+    "INVALID_REQUEST": (
+        502,
+        "geocode_invalid_request",
+        "住所検索のリクエストが不正です。座標を確認してください。",
+    ),
+}
+
+
+def _geocode_error(status_code: int, code: str, message: str) -> HTTPException:
+    """PWA がそのまま表示できる構造化エラーを返す。"""
+
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
+def _mask_secret(text: str) -> str:
+    """上流のエラーメッセージにキーが混ざってもログへ出さない。"""
+
+    if not text:
+        return ""
+    if GOOGLE_MAPS_API_KEY:
+        return text.replace(GOOGLE_MAPS_API_KEY, "[REDACTED]")
+    return text
+
+
+def _clean_japanese_address(formatted: str) -> str:
+    """`日本、〒...` などのプレフィックスを除いた住所文字列を返す。"""
+
+    text = str(formatted or "").strip()
+    if not text:
+        return ""
+    text = _JAPAN_ADDRESS_PREFIX.sub("", text)
+    text = _JAPAN_ADDRESS_SUFFIX.sub("", text)
+    text = _JAPAN_POSTAL_CODE.sub("", text)
+    return text.strip(" 　、,")
+
+
+def _address_from_components(components: Any) -> str:
+    """formatted_address が空のとき、住所構成要素から日本の住所を組み立てる。"""
+
+    wanted = (
+        "administrative_area_level_1",  # 都道府県
+        "locality",  # 市区町村（東京23区は「千代田区」）
+        "ward",
+        "sublocality_level_1",  # 町名
+        "sublocality_level_2",
+        "neighborhood",
+    )
+    parts: list[str] = []
+    for entry in components if isinstance(components, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        types = entry.get("types") or []
+        if not any(kind in wanted for kind in types if isinstance(kind, str)):
+            continue
+        name = str(entry.get("long_name") or "").strip()
+        if name and name not in parts:
+            parts.append(name)
+    return "".join(parts)
+
+
+def _request_google_reverse_geocode(lat: float, lng: float) -> dict[str, Any]:
+    """Google Maps Geocoding API を呼び、住所と座標を取り出す。"""
+
+    params = {
+        "latlng": f"{lat:.6f},{lng:.6f}",
+        "key": GOOGLE_MAPS_API_KEY,
+        "language": "ja",
+    }
+    try:
+        response = requests.get(
+            GOOGLE_GEOCODE_URL,
+            params=params,
+            timeout=GOOGLE_GEOCODE_TIMEOUT,
+        )
+    except requests.Timeout as exc:
+        raise _geocode_error(
+            504,
+            "geocode_timeout",
+            "住所検索がタイムアウトしました。時間をおいて再試行してください。",
+        ) from exc
+    except requests.RequestException as exc:
+        raise _geocode_error(
+            502,
+            "geocode_upstream_error",
+            "住所検索サービスに接続できませんでした。",
+        ) from exc
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise _geocode_error(
+            502,
+            "geocode_invalid_response",
+            "住所検索の応答を読み取れませんでした。",
+        ) from exc
+    if not isinstance(payload, dict):
+        raise _geocode_error(
+            502,
+            "geocode_invalid_response",
+            "住所検索の応答を読み取れませんでした。",
+        )
+
+    status = str(payload.get("status") or "")
+    if status != "OK":
+        logger.warning(
+            "reverse-geocode upstream failed: status=%s message=%s http=%d",
+            status or "EMPTY",
+            _mask_secret(str(payload.get("error_message") or "-")),
+            response.status_code,
+        )
+        failure = _GEOCODE_STATUS_ERRORS.get(status)
+        if failure:
+            raise _geocode_error(*failure)
+        raise _geocode_error(
+            502,
+            "geocode_upstream_error",
+            "住所検索サービスがエラーを返しました。時間をおいて再試行してください。",
+        )
+
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        raise _geocode_error(404, "geocode_not_found", "この座標の住所が見つかりませんでした。")
+    first = results[0] if isinstance(results[0], dict) else {}
+
+    formatted = str(first.get("formatted_address") or "").strip()
+    address = _clean_japanese_address(formatted)
+    if not address:
+        address = _address_from_components(first.get("address_components"))
+    if not address:
+        raise _geocode_error(404, "geocode_not_found", "この座標の住所が見つかりませんでした。")
+
+    geometry = first.get("geometry") if isinstance(first.get("geometry"), dict) else {}
+    location = geometry.get("location") if isinstance(geometry.get("location"), dict) else {}
+    result_lat = location.get("lat")
+    result_lng = location.get("lng")
+    if not isinstance(result_lat, (int, float)) or not isinstance(result_lng, (int, float)):
+        result_lat, result_lng = lat, lng
+
+    place_id = first.get("place_id")
+    return {
+        "address": address,
+        "formatted_address": formatted or address,
+        "lat": float(result_lat),
+        "lng": float(result_lng),
+        "place_id": str(place_id) if place_id else None,
+    }
+
+
+@app.get(
+    "/api/reverse-geocode",
+    response_model=ReverseGeocodeResult,
+    summary="座標から住所を取得する",
+    responses={
+        404: {"description": "住所が見つからない（ZERO_RESULTS）"},
+        422: {"description": "緯度・経度の検証エラー"},
+        502: {"description": "Google Geocoding API の異常応答"},
+        503: {"description": "キー未設定・認証失敗・利用上限"},
+        504: {"description": "Google Geocoding API のタイムアウト"},
+    },
+)
+def reverse_geocode(
+    lat: float = Query(..., ge=-90.0, le=90.0, description="緯度"),
+    lng: float = Query(..., ge=-180.0, le=180.0, description="経度"),
+) -> ReverseGeocodeResult:
+    """指定座標の日本の住所を Google Maps Geocoding API から返す。"""
+
+    if not GOOGLE_MAPS_API_KEY:
+        raise _geocode_error(
+            503,
+            "geocode_not_configured",
+            "住所検索が未設定です（GOOGLE_MAPS_API_KEY）。",
+        )
+
+    started = time.monotonic()
+    result = _request_google_reverse_geocode(lat, lng)
+    elapsed = time.monotonic() - started
+
+    # 住所本文は個人宅の可能性があるため、ログは長さだけにする。
+    logger.info(
+        "reverse-geocode ok: lat=%.6f lng=%.6f chars=%d elapsed=%.2fs",
+        lat,
+        lng,
+        len(result["address"]),
+        elapsed,
+    )
+
+    return ReverseGeocodeResult(
+        **result,
+        fetched_at=datetime.now(JST).isoformat(timespec="seconds"),
     )
 
 

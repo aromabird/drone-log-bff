@@ -376,6 +376,48 @@ print(f"   diagnose OK: model={data['model']} chars={len(text)}")
 PY
 fi
 
+echo "12) reverse-geocode (Google Maps Geocoding API)"
+GEOCODE_CONFIGURED=0
+if [ -n "${GOOGLE_MAPS_API_KEY:-}" ]; then
+  GEOCODE_CONFIGURED=1
+elif [ -f "$ROOT_DIR/.env" ] && grep -Eq '^GOOGLE_MAPS_API_KEY=.+' "$ROOT_DIR/.env"; then
+  GEOCODE_CONFIGURED=1
+fi
+if [ "$GEOCODE_CONFIGURED" != "1" ]; then
+  echo "   SKIP: GOOGLE_MAPS_API_KEY が未設定です（503 geocode_not_configured）。"
+else
+  STATUS="$(curl -sS --max-time 15 -o "$TMP_DIR/reverse_geocode.json" -w '%{http_code}' \
+    "$BASE_URL/api/reverse-geocode?lat=35.681236&lng=139.767125")"
+  if [ "$STATUS" != "200" ]; then
+    echo "ERROR: 200 を期待しましたが $STATUS でした。" >&2
+    cat "$TMP_DIR/reverse_geocode.json" >&2
+    exit 1
+  fi
+  "$PYTHON" - "$TMP_DIR/reverse_geocode.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data.get("ok") is True, data
+address = data.get("address")
+assert isinstance(address, str) and address, data
+assert "日本" not in address and "〒" not in address, data
+assert isinstance(data.get("formatted_address"), str) and data["formatted_address"], data
+assert isinstance(data.get("lat"), (int, float)), data
+assert isinstance(data.get("lng"), (int, float)), data
+print(f"   reverse-geocode OK: {address}")
+PY
+
+  STATUS="$(curl -sS --max-time 10 -o "$TMP_DIR/reverse_geocode_invalid.json" -w '%{http_code}' \
+    "$BASE_URL/api/reverse-geocode?lat=95&lng=139.7")"
+  if [ "$STATUS" != "422" ]; then
+    echo "ERROR: 422 を期待しましたが $STATUS でした。" >&2
+    cat "$TMP_DIR/reverse_geocode_invalid.json" >&2
+    exit 1
+  fi
+  echo "   reverse-geocode validation OK (lat=95 -> 422)"
+fi
+
 echo "ALL TESTS PASSED"
 
 
