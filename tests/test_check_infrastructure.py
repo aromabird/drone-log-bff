@@ -53,6 +53,7 @@ class FakeResponse:
         self.status_code = status_code
         self._chunks = chunks if chunks is not None else [body]
         self._delay = delay
+        self.content = body
         self.closed = False
 
     def iter_content(self, chunk_size: int) -> Iterator[bytes]:  # noqa: ARG002
@@ -95,6 +96,101 @@ class CheckInfrastructureTests(unittest.TestCase):
         self.assertEqual(body["lines_count"], 1)
         self.assertTrue(body["power_risk_detected"])
         post.assert_not_called()
+
+    def _get_airspace(
+        self,
+        is_did: bool | None,
+        lat: float,
+        lon: float,
+        counts: tuple[int, int] = (0, 0),
+    ):
+        """DID 判定と OSM 取得をモックして空域判定だけを検証する。"""
+
+        with patch(
+            "legal.fetch_did_status", return_value=(is_did, "テスト用のDID判定")
+        ), patch("main._fetch_osm_api_counts", return_value=counts), patch(
+            "main.requests.post"
+        ) as post:
+            response = client.get(
+                "/api/check-infrastructure",
+                params={"lat": lat, "lon": lon, "radius": 300},
+            )
+        post.assert_not_called()
+        return response
+
+    def test_did_inside_upgrades_category_to_iib(self) -> None:
+        response = self._get_airspace(True, LAT, LON)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["is_did"])
+        self.assertEqual(body["did_source"], "gsi-did2020")
+        self.assertTrue(body["is_specific_flight"])
+        self.assertEqual(body["specific_flight_basis"], "legal")
+        self.assertEqual(body["category_min"], "IIB")
+        self.assertEqual([flag["key"] for flag in body["legal_flags"]], ["did"])
+        self.assertEqual(body["safety_flags"], [])
+        self.assertFalse(body["is_airport_vicinity"])
+        self.assertIn("DID", body["message"])
+
+    def test_rural_point_is_category_one(self) -> None:
+        response = self._get_airspace(False, 43.66, 142.85)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertFalse(body["is_did"])
+        self.assertFalse(body["is_specific_flight"])
+        self.assertEqual(body["specific_flight_basis"], "none")
+        self.assertEqual(body["category_min"], "I")
+        self.assertEqual(body["legal_flags"], [])
+        self.assertFalse(body["is_airport_vicinity"])
+        self.assertIn("カテゴリーⅠ", body["message"])
+
+    def test_airport_vicinity_is_category_iia(self) -> None:
+        response = self._get_airspace(False, 35.5494, 139.7798)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertTrue(body["is_airport_vicinity"])
+        self.assertEqual(body["airport"]["icao"], "RJTT")
+        self.assertEqual([flag["key"] for flag in body["legal_flags"]], ["airport"])
+        self.assertEqual(body["category_min"], "IIA")
+        self.assertTrue(body["is_specific_flight"])
+        self.assertIn("空港", body["message"])
+
+    def test_unknown_did_is_reported_without_upgrade(self) -> None:
+        response = self._get_airspace(None, 43.66, 142.85)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertIsNone(body["is_did"])
+        self.assertTrue(body["legal_unknown"])
+        self.assertFalse(body["is_specific_flight"])
+        self.assertEqual(body["category_min"], "I")
+        self.assertIn("DIPS", body["message"])
+
+    def test_power_risk_only_uses_safety_basis(self) -> None:
+        response = self._get_airspace(False, 43.66, 142.85, counts=(1, 2))
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["legal_flags"], [])
+        self.assertEqual([flag["key"] for flag in body["safety_flags"]], ["power"])
+        self.assertTrue(body["is_specific_flight"])
+        self.assertEqual(body["specific_flight_basis"], "safety")
+        self.assertEqual(body["category_min"], "IIB")
+        self.assertIn("安全上の要確認", body["message"])
+
+    def test_did_fetch_failure_does_not_break_response(self) -> None:
+        with patch(
+            "legal.fetch_did_status", side_effect=RuntimeError("boom")
+        ), patch("main._fetch_osm_api_counts", return_value=(0, 0)), patch(
+            "main.requests.post"
+        ):
+            response = self._get()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertIsNone(response.json()["is_did"])
 
     def test_osm_failure_falls_back_to_overpass(self) -> None:
         with patch(

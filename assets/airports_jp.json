@@ -1,0 +1,872 @@
+{
+ "source": "OurAirports (https://ourairports.com/data/), public domain / ミラー: https://davidmegginson.github.io/ourairports-data/airports.csv",
+ "generated_at": "2026-11-14",
+ "filter": "iso_country=JP / type in (large_airport, medium_airport)",
+ "count": 108,
+ "airports": [
+  {
+   "name": "成田国際空港",
+   "icao": "RJAA",
+   "iata": "NRT",
+   "lat": 35.76858,
+   "lon": 140.388714,
+   "type": "large_airport"
+  },
+  {
+   "name": "Shinshu-Matsumoto Airport",
+   "icao": "RJAF",
+   "iata": "MMJ",
+   "lat": 36.166801,
+   "lon": 137.923004,
+   "type": "medium_airport"
+  },
+  {
+   "name": "茨城空港",
+   "icao": "RJAH",
+   "iata": "IBR",
+   "lat": 36.181456,
+   "lon": 140.414434,
+   "type": "large_airport"
+  },
+  {
+   "name": "Ioto (Iwo Jima) Airbase",
+   "icao": "RJAW",
+   "iata": "IWO",
+   "lat": 24.784153,
+   "lon": 141.32261,
+   "type": "medium_airport"
+  },
+  {
+   "name": "関西国際空港",
+   "icao": "RJBB",
+   "iata": "KIX",
+   "lat": 34.427299,
+   "lon": 135.244003,
+   "type": "large_airport"
+  },
+  {
+   "name": "Nanki Shirahama Airport",
+   "icao": "RJBD",
+   "iata": "SHM",
+   "lat": 33.662201,
+   "lon": 135.363998,
+   "type": "medium_airport"
+  },
+  {
+   "name": "神戸空港",
+   "icao": "RJBE",
+   "iata": "UKB",
+   "lat": 34.632801,
+   "lon": 135.223999,
+   "type": "large_airport"
+  },
+  {
+   "name": "Konotori Tajima Airport",
+   "icao": "RJBT",
+   "iata": "TJH",
+   "lat": 35.512798,
+   "lon": 134.787003,
+   "type": "medium_airport"
+  },
+  {
+   "name": "帯広空港（とかち）",
+   "icao": "RJCB",
+   "iata": "OBO",
+   "lat": 42.733299,
+   "lon": 143.216995,
+   "type": "medium_airport"
+  },
+  {
+   "name": "新千歳空港",
+   "icao": "RJCC",
+   "iata": "CTS",
+   "lat": 42.774753,
+   "lon": 141.690414,
+   "type": "large_airport"
+  },
+  {
+   "name": "函館空港",
+   "icao": "RJCH",
+   "iata": "HKD",
+   "lat": 41.77,
+   "lon": 140.822006,
+   "type": "large_airport"
+  },
+  {
+   "name": "JASDF Chitose Air Base",
+   "icao": "RJCJ",
+   "iata": "",
+   "lat": 42.794498,
+   "lon": 141.666,
+   "type": "medium_airport"
+  },
+  {
+   "name": "釧路空港",
+   "icao": "RJCK",
+   "iata": "KUH",
+   "lat": 43.041,
+   "lon": 144.192993,
+   "type": "medium_airport"
+  },
+  {
+   "name": "女満別空港",
+   "icao": "RJCM",
+   "iata": "MMB",
+   "lat": 43.8806,
+   "lon": 144.164001,
+   "type": "medium_airport"
+  },
+  {
+   "name": "中標津空港",
+   "icao": "RJCN",
+   "iata": "SHB",
+   "lat": 43.577499,
+   "lon": 144.960007,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Sapporo Okadama Airport",
+   "icao": "RJCO",
+   "iata": "OKD",
+   "lat": 43.117447,
+   "lon": 141.38134,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JASDF Kenebetsu Airfield",
+   "icao": "RJCS",
+   "iata": "",
+   "lat": 43.425154,
+   "lon": 144.741354,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Tokachi Airport",
+   "icao": "RJCT",
+   "iata": "",
+   "lat": 42.890499,
+   "lon": 143.158005,
+   "type": "medium_airport"
+  },
+  {
+   "name": "稚内空港",
+   "icao": "RJCW",
+   "iata": "WKJ",
+   "lat": 45.404202,
+   "lon": 141.800995,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Amakusa Airport",
+   "icao": "RJDA",
+   "iata": "AXJ",
+   "lat": 32.482498,
+   "lon": 130.158997,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Iki Airport",
+   "icao": "RJDB",
+   "iata": "IKI",
+   "lat": 33.749001,
+   "lon": 129.785004,
+   "type": "medium_airport"
+  },
+  {
+   "name": "山口宇部空港",
+   "icao": "RJDC",
+   "iata": "UBJ",
+   "lat": 33.93,
+   "lon": 131.279007,
+   "type": "medium_airport"
+  },
+  {
+   "name": "対馬空港",
+   "icao": "RJDT",
+   "iata": "TSJ",
+   "lat": 34.284901,
+   "lon": 129.330994,
+   "type": "medium_airport"
+  },
+  {
+   "name": "オホーツク紋別空港",
+   "icao": "RJEB",
+   "iata": "MBE",
+   "lat": 44.303902,
+   "lon": 143.404007,
+   "type": "medium_airport"
+  },
+  {
+   "name": "旭川空港",
+   "icao": "RJEC",
+   "iata": "AKJ",
+   "lat": 43.670799,
+   "lon": 142.447006,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Okushiri Airport",
+   "icao": "RJEO",
+   "iata": "OIR",
+   "lat": 42.071701,
+   "lon": 139.432999,
+   "type": "medium_airport"
+  },
+  {
+   "name": "利尻空港",
+   "icao": "RJER",
+   "iata": "RIS",
+   "lat": 45.242001,
+   "lon": 141.186005,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JASDF Ashiya Air Base",
+   "icao": "RJFA",
+   "iata": "",
+   "lat": 33.883099,
+   "lon": 130.653,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Yakushima Airport",
+   "icao": "RJFC",
+   "iata": "KUM",
+   "lat": 30.385599,
+   "lon": 130.658997,
+   "type": "medium_airport"
+  },
+  {
+   "name": "五島福江空港",
+   "icao": "RJFE",
+   "iata": "FUJ",
+   "lat": 32.666302,
+   "lon": 128.832993,
+   "type": "medium_airport"
+  },
+  {
+   "name": "福岡空港",
+   "icao": "RJFF",
+   "iata": "FUK",
+   "lat": 33.585899,
+   "lon": 130.451004,
+   "type": "large_airport"
+  },
+  {
+   "name": "New Tanegashima Airport",
+   "icao": "RJFG",
+   "iata": "TNE",
+   "lat": 30.605101,
+   "lon": 130.990997,
+   "type": "medium_airport"
+  },
+  {
+   "name": "鹿児島空港",
+   "icao": "RJFK",
+   "iata": "KOJ",
+   "lat": 31.8034,
+   "lon": 130.718994,
+   "type": "large_airport"
+  },
+  {
+   "name": "宮崎空港",
+   "icao": "RJFM",
+   "iata": "KMI",
+   "lat": 31.877199,
+   "lon": 131.449005,
+   "type": "large_airport"
+  },
+  {
+   "name": "大分空港",
+   "icao": "RJFO",
+   "iata": "OIT",
+   "lat": 33.479401,
+   "lon": 131.737,
+   "type": "medium_airport"
+  },
+  {
+   "name": "北九州空港",
+   "icao": "RJFR",
+   "iata": "KKJ",
+   "lat": 33.845901,
+   "lon": 131.035004,
+   "type": "large_airport"
+  },
+  {
+   "name": "佐賀空港",
+   "icao": "RJFS",
+   "iata": "HSG",
+   "lat": 33.1497,
+   "lon": 130.302002,
+   "type": "large_airport"
+  },
+  {
+   "name": "熊本空港",
+   "icao": "RJFT",
+   "iata": "KMJ",
+   "lat": 32.837299,
+   "lon": 130.854996,
+   "type": "large_airport"
+  },
+  {
+   "name": "長崎空港",
+   "icao": "RJFU",
+   "iata": "NGS",
+   "lat": 32.916901,
+   "lon": 129.914001,
+   "type": "large_airport"
+  },
+  {
+   "name": "JMSDF Kanoya Air Base",
+   "icao": "RJFY",
+   "iata": "",
+   "lat": 31.36672,
+   "lon": 130.838805,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JASDF Tsuiki Air Base",
+   "icao": "RJFZ",
+   "iata": "",
+   "lat": 33.685001,
+   "lon": 131.039993,
+   "type": "medium_airport"
+  },
+  {
+   "name": "中部国際空港（セントレア）",
+   "icao": "RJGG",
+   "iata": "NGO",
+   "lat": 34.858398,
+   "lon": 136.804993,
+   "type": "large_airport"
+  },
+  {
+   "name": "奄美空港",
+   "icao": "RJKA",
+   "iata": "ASJ",
+   "lat": 28.430599,
+   "lon": 129.712997,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Okinoerabu Airport",
+   "icao": "RJKB",
+   "iata": "OKE",
+   "lat": 27.431604,
+   "lon": 128.705564,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Kikai Airport",
+   "icao": "RJKI",
+   "iata": "KKX",
+   "lat": 28.321301,
+   "lon": 129.927994,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Tokunoshima Airport",
+   "icao": "RJKN",
+   "iata": "TKN",
+   "lat": 27.836382,
+   "lon": 128.881356,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Nagoya Airport / JASDF Komaki Air Base",
+   "icao": "RJNA",
+   "iata": "NKM",
+   "lat": 35.255759,
+   "lon": 136.924095,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Fukui Airport",
+   "icao": "RJNF",
+   "iata": "FKJ",
+   "lat": 36.142799,
+   "lon": 136.223999,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Gifu Airport",
+   "icao": "RJNG",
+   "iata": "QGU",
+   "lat": 35.3941,
+   "lon": 136.869995,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JASDF Hamamatsu Air Base",
+   "icao": "RJNH",
+   "iata": "",
+   "lat": 34.750198,
+   "lon": 137.703003,
+   "type": "medium_airport"
+  },
+  {
+   "name": "小松飛行場",
+   "icao": "RJNK",
+   "iata": "KMQ",
+   "lat": 36.393407,
+   "lon": 136.406895,
+   "type": "large_airport"
+  },
+  {
+   "name": "Oki Global Geopark Airport",
+   "icao": "RJNO",
+   "iata": "OKI",
+   "lat": 36.178388,
+   "lon": 133.323566,
+   "type": "medium_airport"
+  },
+  {
+   "name": "静岡空港",
+   "icao": "RJNS",
+   "iata": "FSZ",
+   "lat": 34.795022,
+   "lon": 138.190976,
+   "type": "large_airport"
+  },
+  {
+   "name": "Toyama Kitokito Airport",
+   "icao": "RJNT",
+   "iata": "TOY",
+   "lat": 36.648416,
+   "lon": 137.187359,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Noto Satoyama Airport",
+   "icao": "RJNW",
+   "iata": "NTQ",
+   "lat": 37.293098,
+   "lon": 136.962006,
+   "type": "medium_airport"
+  },
+  {
+   "name": "静浜基地",
+   "icao": "RJNY",
+   "iata": "",
+   "lat": 34.812801,
+   "lon": 138.298004,
+   "type": "medium_airport"
+  },
+  {
+   "name": "広島空港",
+   "icao": "RJOA",
+   "iata": "HIJ",
+   "lat": 34.4361,
+   "lon": 132.919006,
+   "type": "large_airport"
+  },
+  {
+   "name": "岡山桃太郎空港",
+   "icao": "RJOB",
+   "iata": "OKJ",
+   "lat": 34.756901,
+   "lon": 133.854996,
+   "type": "large_airport"
+  },
+  {
+   "name": "出雲縁結び空港",
+   "icao": "RJOC",
+   "iata": "IZO",
+   "lat": 35.413601,
+   "lon": 132.889999,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JASDF Hofu Airfield",
+   "icao": "RJOF",
+   "iata": "",
+   "lat": 34.034746,
+   "lon": 131.548716,
+   "type": "medium_airport"
+  },
+  {
+   "name": "米子鬼太郎空港",
+   "icao": "RJOH",
+   "iata": "YGJ",
+   "lat": 35.492199,
+   "lon": 133.235992,
+   "type": "medium_airport"
+  },
+  {
+   "name": "岩国錦帯橋空港",
+   "icao": "RJOI",
+   "iata": "IWK",
+   "lat": 34.146333,
+   "lon": 132.247238,
+   "type": "medium_airport"
+  },
+  {
+   "name": "高知龍馬空港",
+   "icao": "RJOK",
+   "iata": "KCZ",
+   "lat": 33.545217,
+   "lon": 133.670166,
+   "type": "large_airport"
+  },
+  {
+   "name": "松山空港",
+   "icao": "RJOM",
+   "iata": "MYJ",
+   "lat": 33.826893,
+   "lon": 132.700114,
+   "type": "large_airport"
+  },
+  {
+   "name": "大阪国際空港（伊丹）",
+   "icao": "RJOO",
+   "iata": "ITM",
+   "lat": 34.780853,
+   "lon": 135.440829,
+   "type": "large_airport"
+  },
+  {
+   "name": "鳥取砂丘コナン空港",
+   "icao": "RJOR",
+   "iata": "TTJ",
+   "lat": 35.530058,
+   "lon": 134.165023,
+   "type": "medium_airport"
+  },
+  {
+   "name": "徳島阿波おどり空港",
+   "icao": "RJOS",
+   "iata": "TKS",
+   "lat": 34.132559,
+   "lon": 134.607816,
+   "type": "large_airport"
+  },
+  {
+   "name": "高松空港",
+   "icao": "RJOT",
+   "iata": "TAK",
+   "lat": 34.214963,
+   "lon": 134.015454,
+   "type": "large_airport"
+  },
+  {
+   "name": "Iwami Airport",
+   "icao": "RJOW",
+   "iata": "IWJ",
+   "lat": 34.676399,
+   "lon": 131.789993,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Yao Airport",
+   "icao": "RJOY",
+   "iata": "",
+   "lat": 34.596298,
+   "lon": 135.602997,
+   "type": "medium_airport"
+  },
+  {
+   "name": "青森空港",
+   "icao": "RJSA",
+   "iata": "AOJ",
+   "lat": 40.733777,
+   "lon": 140.689477,
+   "type": "large_airport"
+  },
+  {
+   "name": "山形空港",
+   "icao": "RJSC",
+   "iata": "GAJ",
+   "lat": 38.4119,
+   "lon": 140.371002,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Sado Airport",
+   "icao": "RJSD",
+   "iata": "SDS",
+   "lat": 38.0602,
+   "lon": 138.414001,
+   "type": "medium_airport"
+  },
+  {
+   "name": "福島空港",
+   "icao": "RJSF",
+   "iata": "FKS",
+   "lat": 37.227402,
+   "lon": 140.431,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JMSDF Hachinohe Air Base / Hachinohe Airport",
+   "icao": "RJSH",
+   "iata": "HHE",
+   "lat": 40.551181,
+   "lon": 141.465428,
+   "type": "medium_airport"
+  },
+  {
+   "name": "花巻空港",
+   "icao": "RJSI",
+   "iata": "HNA",
+   "lat": 39.4286,
+   "lon": 141.134995,
+   "type": "medium_airport"
+  },
+  {
+   "name": "秋田空港",
+   "icao": "RJSK",
+   "iata": "AXT",
+   "lat": 39.615601,
+   "lon": 140.218994,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Misawa Airport / Misawa Air Base",
+   "icao": "RJSM",
+   "iata": "MSJ",
+   "lat": 40.703201,
+   "lon": 141.367996,
+   "type": "medium_airport"
+  },
+  {
+   "name": "新潟空港",
+   "icao": "RJSN",
+   "iata": "KIJ",
+   "lat": 37.954166,
+   "lon": 139.112189,
+   "type": "large_airport"
+  },
+  {
+   "name": "Odate Noshiro Airport",
+   "icao": "RJSR",
+   "iata": "ONJ",
+   "lat": 40.191898,
+   "lon": 140.371002,
+   "type": "medium_airport"
+  },
+  {
+   "name": "仙台空港",
+   "icao": "RJSS",
+   "iata": "SDJ",
+   "lat": 38.139702,
+   "lon": 140.917007,
+   "type": "large_airport"
+  },
+  {
+   "name": "JASDF Matsushima Air Base",
+   "icao": "RJST",
+   "iata": "",
+   "lat": 38.4049,
+   "lon": 141.220001,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Shonai Airport",
+   "icao": "RJSY",
+   "iata": "SYO",
+   "lat": 38.812199,
+   "lon": 139.787003,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JMSDF Atsugi Air Base / Naval Air Facility Atsugi",
+   "icao": "RJTA",
+   "iata": "NJA",
+   "lat": 35.454601,
+   "lon": 139.449997,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JMSDF Tateyama Air Base",
+   "icao": "RJTE",
+   "iata": "",
+   "lat": 34.987099,
+   "lon": 139.828995,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Chofu Airport",
+   "icao": "RJTF",
+   "iata": "",
+   "lat": 35.6717,
+   "lon": 139.528,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Hachijojima Airport",
+   "icao": "RJTH",
+   "iata": "HAC",
+   "lat": 33.114843,
+   "lon": 139.785645,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Iruma Air Base",
+   "icao": "RJTJ",
+   "iata": "",
+   "lat": 35.8419,
+   "lon": 139.410995,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JGSDF Kisarazu Airfield",
+   "icao": "RJTK",
+   "iata": "",
+   "lat": 35.3983,
+   "lon": 139.910004,
+   "type": "medium_airport"
+  },
+  {
+   "name": "JMSDF Shimofusa Air Base",
+   "icao": "RJTL",
+   "iata": "",
+   "lat": 35.798901,
+   "lon": 140.011002,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Oshima Airport",
+   "icao": "RJTO",
+   "iata": "OIM",
+   "lat": 34.782001,
+   "lon": 139.360001,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Miyakejima Airport",
+   "icao": "RJTQ",
+   "iata": "MYE",
+   "lat": 34.073601,
+   "lon": 139.559998,
+   "type": "medium_airport"
+  },
+  {
+   "name": "東京国際空港（羽田）",
+   "icao": "RJTT",
+   "iata": "HND",
+   "lat": 35.549678,
+   "lon": 139.786958,
+   "type": "large_airport"
+  },
+  {
+   "name": "Utsunomiya Air Field",
+   "icao": "RJTU",
+   "iata": "",
+   "lat": 36.5145,
+   "lon": 139.87101,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Yokota Air Base",
+   "icao": "RJTY",
+   "iata": "OKO",
+   "lat": 35.748501,
+   "lon": 139.348007,
+   "type": "medium_airport"
+  },
+  {
+   "name": "那覇空港",
+   "icao": "ROAH",
+   "iata": "OKA",
+   "lat": 26.192437,
+   "lon": 127.639804,
+   "type": "large_airport"
+  },
+  {
+   "name": "Kadena Air Base",
+   "icao": "RODN",
+   "iata": "DNA",
+   "lat": 26.351667,
+   "lon": 127.769444,
+   "type": "large_airport"
+  },
+  {
+   "name": "新石垣空港",
+   "icao": "ROIG",
+   "iata": "ISG",
+   "lat": 24.396389,
+   "lon": 124.245,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Kumejima Airport",
+   "icao": "ROKJ",
+   "iata": "UEO",
+   "lat": 26.363445,
+   "lon": 126.71384,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Minamidaito Airport",
+   "icao": "ROMD",
+   "iata": "MMD",
+   "lat": 25.8465,
+   "lon": 131.263,
+   "type": "medium_airport"
+  },
+  {
+   "name": "宮古空港",
+   "icao": "ROMY",
+   "iata": "MMY",
+   "lat": 24.782801,
+   "lon": 125.294998,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Iejima Airport",
+   "icao": "RORE",
+   "iata": "IEJ",
+   "lat": 26.722537,
+   "lon": 127.786801,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Kitadaito Airport",
+   "icao": "RORK",
+   "iata": "KTD",
+   "lat": 25.9447,
+   "lon": 131.326996,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Shimojishima Airport",
+   "icao": "RORS",
+   "iata": "SHI",
+   "lat": 24.8267,
+   "lon": 125.144997,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Tarama Airport",
+   "icao": "RORT",
+   "iata": "TRA",
+   "lat": 24.653793,
+   "lon": 124.675453,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Yoron Airport",
+   "icao": "RORY",
+   "iata": "RNJ",
+   "lat": 27.043847,
+   "lon": 128.401648,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Futenma Marine Corps Air Station",
+   "icao": "ROTM",
+   "iata": "",
+   "lat": 26.2743,
+   "lon": 127.755997,
+   "type": "medium_airport"
+  },
+  {
+   "name": "Yonaguni Airport",
+   "icao": "ROYN",
+   "iata": "OGN",
+   "lat": 24.467298,
+   "lon": 122.979827,
+   "type": "medium_airport"
+  }
+ ]
+}

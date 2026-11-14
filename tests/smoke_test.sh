@@ -288,6 +288,32 @@ assert isinstance(data.get("detail"), list), data
 print("   check-infrastructure validation OK: 422")
 PY
 
+echo "9b) check-infrastructure airspace (品川駅 → DID / カテゴリーⅡB)"
+STATUS="$(curl -sS --max-time 20 -o "$TMP_DIR/infra_shinagawa.json" -w '%{http_code}' \
+  "$BASE_URL/api/check-infrastructure?lat=35.6284&lon=139.7387&radius=300")"
+if [ "$STATUS" != "200" ]; then
+  echo "ERROR: 200 を期待しましたが $STATUS でした。" >&2
+  cat "$TMP_DIR/infra_shinagawa.json" >&2
+  exit 1
+fi
+"$PYTHON" - "$TMP_DIR/infra_shinagawa.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data["is_did"] is True, data
+assert data["did_source"] == "gsi-did2020", data
+assert data["is_airport_vicinity"] is False, data
+assert data["airport"]["icao"] == "RJTT", data
+assert data["category_min"] == "IIB", data
+assert data["specific_flight_basis"] == "legal", data
+assert "did" in [flag["key"] for flag in data["legal_flags"]], data
+assert data["legal_unknown"] is False, data
+assert data["elapsed_ms"] < 9000, data
+print(f"   airspace OK: category={data['category_min']} did={data['is_did']} "
+      f"airport={data['airport']['icao']} elapsed={data['elapsed_ms']}ms")
+PY
+
 DIAGNOSE_JSON="$ROOT_DIR/tests/diagnose_conditions.json"
 AI_CONFIGURED=0
 if [ -n "${GEMINI_API_KEY:-}" ]; then

@@ -10,7 +10,9 @@ PWA がそのまま使える飛行サマリー JSON を返します。
 オンメモリ生成した `.xlsx` を返します（ディスクへは保存しません）。
 
 `GET /api/check-infrastructure` では、指定座標の周辺にある送電線・鉄塔を
-Overpass API（OpenStreetMap）から取得し、PWA のリスク判定用 JSON を返します。
+Overpass API（OpenStreetMap）から取得し、あわせて国土地理院 DID2020 タイル
+（人口集中地区）と同梱の空港データ（OurAirports）から空域を判定して、
+PWA のリスク判定・特定飛行区分用 JSON を返します。
 
 `GET /api/reverse-geocode` では、指定座標の日本の住所を Google Maps Geocoding API
 から取得し、「日本、〒…」を除いた住所文字列を返します。キーは BFF の `.env` だけで
@@ -214,8 +216,8 @@ curl -sS -X POST -H 'Content-Type: application/json' \
 
 ### `GET /api/check-infrastructure`
 
-指定座標から半径 `radius` メートル以内の `power=tower`（鉄塔）と
-`power=line`（送電線）を数え、PWA のリスク判定用 JSON を返します。
+指定座標の**空域（人口集中地区・空港等の周辺）**と、半径 `radius` メートル以内の
+`power=tower`（鉄塔）・`power=line`（送電線）を判定し、PWA 用の JSON を返します。
 
 - クエリパラメータ
   - `lat`（必須）: 緯度 `-90.0`〜`90.0`
@@ -236,10 +238,75 @@ curl -sS -X POST -H 'Content-Type: application/json' \
   "power_risk_detected": false,
   "towers_count": 0,
   "lines_count": 0,
-  "message": "周辺インフラ（送電線・鉄塔）の異常なし",
+  "message": "人口集中地区（DID）の上空のため特定飛行に該当します（カテゴリーⅡB以上）。周辺インフラ（送電線・鉄塔）の異常なし",
   "source": "osm-api",
-  "elapsed_ms": 1700
+  "elapsed_ms": 2265,
+  "is_did": true,
+  "did_source": "gsi-did2020",
+  "did_note": "国土地理院 DID2020（2020年国勢調査）: 人口集中地区内",
+  "is_airport_vicinity": false,
+  "airport": {
+    "name": "東京国際空港（羽田）",
+    "icao": "RJTT",
+    "iata": "HND",
+    "distance_m": 9781,
+    "radius_m": 6000,
+    "vicinity": false,
+    "nearby": true
+  },
+  "legal_flags": [
+    {
+      "key": "did",
+      "label": "DID（人口集中地区）",
+      "detail": "国土地理院 DID2020（2020年国勢調査）: 人口集中地区内"
+    }
+  ],
+  "safety_flags": [],
+  "is_specific_flight": true,
+  "specific_flight_basis": "legal",
+  "category_min": "IIB",
+  "category_label": "カテゴリーⅡB",
+  "category_reasons": ["人口集中地区（DID）の上空"],
+  "legal_unknown": false
 }
+```
+
+| フィールド | 意味 |
+|---|---|
+| `is_did` | DID 内なら `true`、DID 外なら `false`、判定不能（通信失敗等）は `null` |
+| `did_source` / `did_note` | 判定に使ったデータ（`gsi-did2020`）と補足 |
+| `is_airport_vicinity` | 最寄り空港から 6km 以内（空港等の周辺の**目安**） |
+| `airport` | 最寄り空港（同梱データ）。`distance_m` は空港の標点からの距離 |
+| `legal_flags` | 法令上の特定飛行に該当する項目（`key` は PWA のチェック項目と一致） |
+| `safety_flags` | 安全上の要確認（送電線・鉄塔）。**法令上の特定飛行ではない** |
+| `specific_flight_basis` | `legal`（法令上）/ `safety`（安全上）/ `none` |
+| `category_min` / `category_label` | 空域から決まる下限カテゴリー（`IIA` は空港周辺、`IIB` は DID 等） |
+| `legal_unknown` | `true` のときは DID を判定できていない（DIPS での確認が必要） |
+
+判定の考え方:
+
+- **DID**: 国土地理院の [DID2020 タイル](https://cyberjapandata.gsi.go.jp/xyz/did2020/)
+  （ズーム16・PNG/alpha）をサーバー側で取得し、対象ピクセルが不透明なら DID 内と判定します。
+  タイルが `404` の場合は「そのタイルに DID が無い」ことを意味します。画像のデコードは
+  標準ライブラリ（`zlib` / `struct`）だけで行い、Pillow は使いません。結果は
+  `(ズーム, x, y, ピクセル)` 単位で 24 時間キャッシュします。
+- **空港等の周辺**: 航空法上の「空港等の周辺空域」は進入表面・転移表面などの表面で
+  定義され、**半径の数値規定はありません**。本 BFF は実務上の目安として、同梱の
+  空港データ（`assets/airports_jp.json`、OurAirports の large/medium 空港 108 件）から
+  6km 以内を「該当（目安）」、12km 以内を「近接（要確認）」として扱います。
+  最終判断は [DIPS](https://www.dips.mlit.go.jp/) や地理院地図で行ってください。
+- **カテゴリー**: 空域だけで決まる**下限**を返します。実際のカテゴリーは機体重量・
+  立入管理措置でも変わるため、最終表示は PWA 側の `judgeCategoryLocal()` が決めます。
+
+DID の取得は OSM 取得と**並列**に走らせ、3 秒（`INFRA_LEGAL_TIMEOUT_SECONDS`）で
+打ち切ります。GSI が遅い・落ちている場合は `is_did=null` / `legal_unknown=true` とし、
+**特定飛行へ自動で引き上げません**（PWA は DIPS での確認を促します）。
+
+空港データを更新する場合（四半期に一度程度）:
+
+```bash
+cd drone-log-bff
+.venv/bin/python tools/build_airports_json.py   # assets/airports_jp.json を再生成
 ```
 
 リスクがある場合は `power_risk_detected=true` になり、`message` に鉄塔数・
@@ -492,6 +559,11 @@ HTML としては解釈しません。操縦者の氏名・連絡先は受け取
   2026年時点で混雑が常態化しており、406/タイムアウトが発生する。本 BFF は
   OSM API へフォールバックするが、半径 2000m など広範囲では OSM API の
   取得上限（50,000 nodes）に達して失敗する場合がある。PWA は既定の 300m を使う。
+- 空港等の周辺は進入表面・転移表面の上空という法令上の定義を、空港標点からの
+  距離（6km / 12km）で近似した**目安**であり、法的な境界ではない。
+- DID は 2020年国勢調査に基づく DID2020 の判定で、その後の市街化は反映されない。
+  また GSI タイルを取得できない場合は `is_did=null`（判定不能）となり、
+  特定飛行へ自動で引き上げない。
 
 ## テスト
 
@@ -513,13 +585,28 @@ cd drone-log-bff
 7. CORS プリフライト（許可オリジンのエコー / 許可外オリジンの拒否）
 8. 飛行日誌 Excel の生成（セル値・Content-Type・ファイル名）
 9. 周辺インフラ API の入力バリデーション（緯度91 → 422）
+9b. 周辺インフラ API の空域判定（品川駅 → DID 内 / `category_min=IIB`）
 10. AI 診断の入力バリデーション（`source=photo` / `source=map` で画像なし → 422 / `image_required`）
 11. AI 診断の実呼び出し（Gemini / `conditions`）— `GEMINI_API_KEY` 未設定時は SKIP
 
-`GET /api/check-infrastructure` の実データ取得は外部 API（Overpass / OSM API）へ
-アクセスするため、`smoke_test.sh` には含めていません。手元では上記の curl 例で確認してください。
+`GET /api/check-infrastructure` の送電線・鉄塔は外部 API（Overpass / OSM API）へ
+アクセスするため、`smoke_test.sh` では空域判定（DID / 空港）だけを確認しています。
 Overpass が混雑している場合は、OSM API フォールバックにより 20〜40 秒ほど
 かかることがあります。
+
+外部へ接続しないユニットテスト:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -v   # 全件（実 API テストは SKIP）
+DRONE_LOG_LIVE=1 .venv/bin/python tests/test_infrastructure_live.py -v
+```
+
+- `tests/test_legal.py`: PNG デコード（フィルタ0〜4）・タイル座標・
+  DID の 404 / 不透明 / 透明 / タイムアウト・空港距離・カテゴリー判定
+- `tests/test_check_infrastructure.py`: 取得元の切り替え・deadline に加え、
+  DID 内 → ⅡB / 空港周辺 → ⅡA / DID 外 → Ⅰ / 判定不能 / 送電線のみ（安全上）
+- `tests/test_infrastructure_live.py`: 実 API（GSI / OSM）で品川駅・羽田・大雪山を検証。
+  `DRONE_LOG_LIVE=1` を指定したときだけ実行。
 
 Gemini を呼ばないオフラインのユニットテストは `tests/test_diagnose.py` です
 （`_request_gemini_text` をモックし、正常系・画像検証・エラー対応を確認）。
@@ -580,11 +667,16 @@ cd drone-log-bff
 ```text
 drone-log-bff/
 ├── main.py
+├── legal.py                   # DID（地理院タイル）/ 空港周辺の判定・カテゴリー下限
 ├── requirements.txt
 ├── .gitignore
 ├── README.md
 ├── template/
 │   └── flight_record_template.xlsx  # 国交省様式1の公式Excelテンプレート
+├── assets/
+│   └── airports_jp.json       # 日本の主要空港108件（OurAirports / public domain）
+├── tools/
+│   └── build_airports_json.py # airports_jp.json の再生成
 ├── data/                      # 実行時に自動作成（.gitignore / 0700）
 │   └── backup.json            # PWAのlocalStorageバックアップ（0600）
 └── tests/
@@ -593,6 +685,8 @@ drone-log-bff/
     ├── export_sample.json      # export-log のリクエスト例
     ├── smoke_test.sh
     ├── backup_test.sh          # バックアップAPI（一時データディレクトリ）
+    ├── test_legal.py           # DID / 空港判定のオフラインテスト
+    ├── test_infrastructure_live.py  # 実 API テスト（DRONE_LOG_LIVE=1）
     └── fixtures/
         ├── README.md           # 出典・ライセンス・期待値
         └── minimal_v14.txt     # v14 最小ログ（Details 復号検証）
