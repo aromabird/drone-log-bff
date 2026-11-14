@@ -139,33 +139,52 @@ curl -sS -X POST -H 'Content-Type: application/json' \
   - `radius`（任意）: 検索半径（m）。既定 `300`、`50`〜`2000`
 - 成功時: `200` + 下記 JSON
 - 入力不備: `422`（FastAPI 標準）
-- Overpass 混雑・障害: 公式 OSM API（`/api/0.6/map`）へ自動フォールバック
-  - フォールバックも失敗した場合は `502` / `503` / `504` + エラーコード
+- 取得元の優先順
+  - `radius` が `1000` 以下: 公式 OSM API（`/api/0.6/map`）を先に試し、失敗時のみ Overpass API
+  - `radius` が `1000` 超: Overpass API を先に試し、失敗時のみ OSM API
+- 混雑・障害時: `502` / `503` / `504` + エラーコード（例: `overpass_busy`、`osm_api_area_too_large`）
+- 総処理時間が 15 秒を超えた場合は `504`（`infra_deadline_exceeded`）
 
 ```json
 {
   "power_risk_detected": false,
   "towers_count": 0,
   "lines_count": 0,
-  "message": "周辺インフラ（送電線・鉄塔）の異常なし"
+  "message": "周辺インフラ（送電線・鉄塔）の異常なし",
+  "source": "osm-api",
+  "elapsed_ms": 1700
 }
 ```
 
 リスクがある場合は `power_risk_detected=true` になり、`message` に鉄塔数・
 送電線数と飛行前の確認事項が入ります。PWA はこの値で赤（警告）／緑（安全）の
-アラートを切り替えます。
+アラートを切り替え、`source` / `elapsed_ms` を「出典」として併記します。
 
 ```bash
 curl -sS \
   'http://127.0.0.1:8000/api/check-infrastructure?lat=35.9000&lon=140.0000&radius=300'
 ```
 
-Overpass API は混雑時に `406` / `429` / `502` / `503` / `504` を返すことがあります。
-本 BFF は短い間隔で 1 回再試行し、それでも失敗した場合に公式 OSM API の bbox を
-使って同じ判定を継続します。OSM API の bbox は半径から自動計算し、BFF 側で
-点と線分の距離をメートル単位で評価します。ログには `source=overpass` または
-`source=osm-api` を出力します。接続先は環境変数 `OVERPASS_API_URL` /
-`OSM_API_URL` で変更できます。
+Overpass API は混雑時に `406` / `429` / `502` / `503` / `504` を返すか、応答せずに
+タイムアウトすることがあります（実測では `overpass-api.de` が 406/429、ミラーが
+20 秒無応答になる時間帯がありました）。そのため本 BFF は次のように動作します。
+
+1. 小半径（`1000m` 以下）は応答が速い OSM API を優先する（実測 1〜3 秒）。
+2. Overpass へ問い合わせる場合は 接続3秒・応答6秒で打ち切り、タイムアウトは再試行しない。
+3. Overpass の失敗が確定したら 300 秒間は Overpass を試さない（サーキットブレーカー）。
+4. どちらも失敗した場合は、より具体的なエラー（`overpass_timeout` / `osm_api_area_too_large` など）を返す。
+
+OSM API の bbox は半径から自動計算し、BFF 側で点と線分の距離をメートル単位で
+評価します。ただし bbox 内の node が 5 万件を超えると OSM API は `400` を返すため、
+市街地の `radius` 1500m 以上では Overpass が必要です。
+
+ログには `source=overpass` / `source=osm-api` と `elapsed_ms` を出力します。
+接続先は次の環境変数で変更できます。
+
+| 環境変数 | 既定値 | 用途 |
+|---|---|---|
+| `OVERPASS_API_URLS` | `https://overpass-api.de/api/interpreter` | カンマ区切りでミラーを順に試す（旧 `OVERPASS_API_URL` も可） |
+| `OSM_API_URL` | `https://api.openstreetmap.org/api/0.6/map` | OSM API の bbox 取得先 |
 
 ### `POST /api/parse-log`
 
