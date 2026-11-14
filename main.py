@@ -118,9 +118,9 @@ OVERPASS_API_URLS = [
     ).split(",")
     if url.strip()
 ]
-# タイムアウトしたミラーを待ち続けないよう、接続3秒・応答6秒に抑える。
+# タイムアウトしたミラーを待ち続けないよう、接続3秒・応答5秒に抑える。
 # timeout はリトライしない（待ち時間が倍になるだけで成功率が上がらないため）。
-OVERPASS_REQUEST_TIMEOUT = (3.0, 6.0)
+OVERPASS_REQUEST_TIMEOUT = (3.0, 5.0)
 OVERPASS_TRANSIENT_STATUS = frozenset({406, 429, 502, 503, 504})
 # Overpass が落ちていると判定したら、この秒数だけ Overpass を試さない。
 OVERPASS_COOLDOWN_SECONDS = 300.0
@@ -130,7 +130,12 @@ _OVERPASS_DOWN_UNTIL = 0.0
 OSM_API_PREFERRED_MAX_RADIUS = 1000
 
 # 1リクエストあたりの総処理時間の上限。超過したら 504 を返して PWA に委ねる。
-INFRA_DEADLINE_SECONDS = 15.0
+# PWA 側は12秒で打ち切るため、BFF が先に構造化エラーを返せるよう 9 秒に抑える。
+INFRA_DEADLINE_SECONDS = 9.0
+
+# 応答本文の上限。OSM API は市街地の半径300mでも数MB（東京駅で約3.9MB）返す。
+# 想定外の巨大応答でメモリを消費しないよう上限を設ける。
+INFRA_MAX_RESPONSE_BYTES = 24 * 1024 * 1024
 
 # Overpass が混雑・障害のときだけ使う公式 OSM API のフォールバック。
 # bbox 内の全要素を取得し、BFF 側で半径内の鉄塔・送電線を数える。
@@ -473,6 +478,49 @@ def _overpass_error(code: str, message: str, status_code: int) -> HTTPException:
     )
 
 
+def _bounded_timeout(
+    deadline: float, connect: float, read: float
+) -> tuple[float, float]:
+    """残り時間に収まる (connect, read) タイムアウトを返す。
+
+    取得元をフォールバックする場合でも、総処理時間が
+    `INFRA_DEADLINE_SECONDS` を超えないようにする。
+    """
+
+    remaining = max(0.5, deadline - time.monotonic())
+    return (min(connect, remaining), min(read, remaining))
+
+
+def _read_body_with_deadline(response: requests.Response, deadline: float) -> bytes:
+    """応答本文をチャンクで読み、総時間が deadline を超えたら打ち切る。
+
+    `requests` の read timeout は「1回の読み取り」にしか効かないため、数MBの
+    OSM 応答が細切れに届くと総時間が際限なく伸びる（PWA 側は20秒で打ち切る）。
+    BFF が先に 504 を返せるよう、ここで総時間を監視する。
+    """
+
+    chunks: list[bytes] = []
+    total = 0
+    for chunk in response.iter_content(64 * 1024):
+        if not chunk:
+            continue
+        total += len(chunk)
+        if total > INFRA_MAX_RESPONSE_BYTES:
+            raise _overpass_error(
+                "infra_response_too_large",
+                "周辺インフラ情報の応答が大きすぎます。半径を小さくして再試行してください。",
+                502,
+            )
+        chunks.append(chunk)
+        if time.monotonic() > deadline:
+            raise _overpass_error(
+                "infra_deadline_exceeded",
+                "周辺インフラ情報の取得に時間がかかりすぎました。時間をおいて再試行してください。",
+                504,
+            )
+    return b"".join(chunks)
+
+
 def _overpass_available() -> bool:
     """サーキットブレーカー: 直近の失敗から一定時間は Overpass を試さない。"""
 
@@ -489,7 +537,7 @@ def _mark_overpass_down(reason: str) -> None:
     )
 
 
-def _request_overpass(query: str) -> dict[str, Any]:
+def _request_overpass(query: str, deadline: float) -> dict[str, Any]:
     """Overpass API（`OVERPASS_API_URLS` の順）へクエリを送り、JSON を返す。
 
     混雑・クォータ超過時は 406/429/502/503/504 が返るため、次のミラーへ切り替える。
@@ -516,7 +564,8 @@ def _request_overpass(query: str) -> dict[str, Any]:
                     "User-Agent": f"{SERVICE_NAME}/0.4.0",
                     "Accept": "application/json",
                 },
-                timeout=OVERPASS_REQUEST_TIMEOUT,
+                timeout=_bounded_timeout(deadline, *OVERPASS_REQUEST_TIMEOUT),
+                stream=True,
             )
         except requests.Timeout as exc:
             logger.warning("overpass timeout: url=%s", url)
@@ -534,7 +583,22 @@ def _request_overpass(query: str) -> dict[str, Any]:
 
         if response.status_code == 200:
             try:
-                payload = response.json()
+                body = _read_body_with_deadline(response, deadline)
+            except requests.RequestException as exc:
+                logger.warning(
+                    "overpass read failed: url=%s error=%s", url, type(exc).__name__
+                )
+                _mark_overpass_down("read_failed")
+                raise _overpass_error(
+                    "overpass_unavailable",
+                    "周辺インフラ情報を取得できませんでした。時間をおいて再試行してください。",
+                    502,
+                ) from exc
+            finally:
+                response.close()
+
+            try:
+                payload = json.loads(body)
             except ValueError as exc:
                 _mark_overpass_down("invalid_json")
                 raise _overpass_error(
@@ -553,6 +617,7 @@ def _request_overpass(query: str) -> dict[str, Any]:
             return payload
 
         last_status = response.status_code
+        response.close()
         logger.warning("overpass HTTP error: url=%s status=%d", url, last_status)
 
         if last_status not in OVERPASS_TRANSIENT_STATUS:
@@ -704,11 +769,14 @@ def _count_osm_api_elements(
     return towers_count, lines_count
 
 
-def _fetch_osm_api_counts(lat: float, lon: float, radius: int) -> tuple[int, int]:
+def _fetch_osm_api_counts(
+    lat: float, lon: float, radius: int, deadline: float
+) -> tuple[int, int]:
     """公式 OSM API の bbox から鉄塔・送電線を数える。
 
     小半径では Overpass より速く安定しているため、既定の取得元として使う。
     bbox は半径から算出し、要素は中心からの距離で絞り込む。
+    応答は市街地で数MBになるため、本文の読み取りにも総時間の上限を設ける。
     """
 
     min_lon, min_lat, max_lon, max_lat = _osm_bbox(lat, lon, radius)
@@ -721,7 +789,8 @@ def _fetch_osm_api_counts(lat: float, lon: float, radius: int) -> tuple[int, int
                 "User-Agent": f"{SERVICE_NAME}/0.4.0",
                 "Accept": "application/xml",
             },
-            timeout=OSM_API_TIMEOUT,
+            timeout=_bounded_timeout(deadline, *OSM_API_TIMEOUT),
+            stream=True,
         )
     except requests.Timeout as exc:
         raise _overpass_error(
@@ -736,29 +805,42 @@ def _fetch_osm_api_counts(lat: float, lon: float, radius: int) -> tuple[int, int
             502,
         ) from exc
 
-    if response.status_code in (400, 413):
-        # OSM API は bbox 内の node が 5 万件を超えると 400 を返す。
-        # 半径 1500m 以上を市街地で指定すると該当するため、理由を明示する。
-        logger.warning(
-            "OSM API rejected bbox: status=%d radius=%d", response.status_code, radius
-        )
-        raise _overpass_error(
-            "osm_api_area_too_large",
-            "検索範囲が広すぎて周辺インフラを取得できませんでした。"
-            "半径を小さくするか、時間をおいて再試行してください。",
-            503,
-        )
+    try:
+        if response.status_code in (400, 413):
+            # OSM API は bbox 内の node が 5 万件を超えると 400 を返す。
+            # 半径 1500m 以上を市街地で指定すると該当するため、理由を明示する。
+            logger.warning(
+                "OSM API rejected bbox: status=%d radius=%d", response.status_code, radius
+            )
+            raise _overpass_error(
+                "osm_api_area_too_large",
+                "検索範囲が広すぎて周辺インフラを取得できませんでした。"
+                "半径を小さくするか、時間をおいて再試行してください。",
+                503,
+            )
 
-    if response.status_code != 200:
-        logger.warning("OSM API fallback failed: status=%d", response.status_code)
-        raise _overpass_error(
-            "osm_api_unavailable",
-            "周辺インフラ情報を取得できませんでした。時間をおいて再試行してください。",
-            502 if response.status_code < 500 else 503,
-        )
+        if response.status_code != 200:
+            logger.warning("OSM API fallback failed: status=%d", response.status_code)
+            raise _overpass_error(
+                "osm_api_unavailable",
+                "周辺インフラ情報を取得できませんでした。時間をおいて再試行してください。",
+                502 if response.status_code < 500 else 503,
+            )
+
+        try:
+            content = _read_body_with_deadline(response, deadline)
+        except requests.RequestException as exc:
+            logger.warning("OSM API read failed: error=%s", type(exc).__name__)
+            raise _overpass_error(
+                "osm_api_unavailable",
+                "周辺インフラ情報を取得できませんでした。通信状況を確認して再試行してください。",
+                502,
+            ) from exc
+    finally:
+        response.close()
 
     try:
-        root = ET.fromstring(response.content)
+        root = ET.fromstring(content)
     except ET.ParseError as exc:
         raise _overpass_error(
             "osm_api_invalid_response",
@@ -902,10 +984,14 @@ def check_infrastructure(
             break
         try:
             if provider == "overpass":
-                payload = _request_overpass(_overpass_query(lat, lon, radius))
+                payload = _request_overpass(
+                    _overpass_query(lat, lon, radius), deadline
+                )
                 towers_count, lines_count = _count_overpass_elements(payload)
             else:
-                towers_count, lines_count = _fetch_osm_api_counts(lat, lon, radius)
+                towers_count, lines_count = _fetch_osm_api_counts(
+                    lat, lon, radius, deadline
+                )
             source = provider
             break
         except HTTPException as exc:

@@ -227,7 +227,9 @@ curl -sS -X POST -H 'Content-Type: application/json' \
   - `radius` が `1000` 以下: 公式 OSM API（`/api/0.6/map`）を先に試し、失敗時のみ Overpass API
   - `radius` が `1000` 超: Overpass API を先に試し、失敗時のみ OSM API
 - 混雑・障害時: `502` / `503` / `504` + エラーコード（例: `overpass_busy`、`osm_api_area_too_large`）
-- 総処理時間が 15 秒を超えた場合は `504`（`infra_deadline_exceeded`）
+- 総処理時間が 9 秒を超えた場合は `504`（`infra_deadline_exceeded`）。
+  応答本文が細切れに届く場合もチャンク読み取り中に deadline を監視して打ち切るため、
+  クライアントが長時間待たされることはありません（PWA は 12 秒で打ち切り、無応答時は 1 回だけ自動再試行）。
 
 ```json
 {
@@ -254,7 +256,8 @@ Overpass API は混雑時に `406` / `429` / `502` / `503` / `504` を返すか�
 20 秒無応答になる時間帯がありました）。そのため本 BFF は次のように動作します。
 
 1. 小半径（`1000m` 以下）は応答が速い OSM API を優先する（実測 1〜3 秒）。
-2. Overpass へ問い合わせる場合は 接続3秒・応答6秒で打ち切り、タイムアウトは再試行しない。
+2. Overpass へ問い合わせる場合は 接続3秒・応答5秒で打ち切り、タイムアウトは再試行しない。
+   残り時間が `INFRA_DEADLINE_SECONDS` を下回っている場合は、その残り時間を上限にする。
 3. Overpass の失敗が確定したら 300 秒間は Overpass を試さない（サーキットブレーカー）。
 4. どちらも失敗した場合は、より具体的なエラー（`overpass_timeout` / `osm_api_area_too_large` など）を返す。
 
