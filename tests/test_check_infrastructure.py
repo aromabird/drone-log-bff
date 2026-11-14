@@ -69,8 +69,13 @@ class FakeResponse:
 
 class CheckInfrastructureTests(unittest.TestCase):
     def setUp(self) -> None:
-        # テスト間でサーキットブレーカーの状態を持ち越さない。
+        # テスト間でサーキットブレーカー・キャッシュの状態を持ち越さない。
         main._OVERPASS_DOWN_UNTIL = 0.0
+        main.clear_infra_cache()
+        # 再試行の待機はテストでは 10ms に縮める（回数と順序だけを検証する）。
+        patcher = patch.object(main, "INFRA_RETRY_BASE_SECONDS", 0.01)
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _get(self):
         return client.get(
@@ -216,9 +221,9 @@ class CheckInfrastructureTests(unittest.TestCase):
     def test_did_and_osm_run_in_parallel(self) -> None:
         """DID と OSM の取得が並列に走り、待ち時間が直列にならないこと。"""
 
-        def slow_counts(*_args, **_kwargs) -> tuple[int, int, str]:
+        def slow_counts(*_args, **_kwargs) -> tuple[int, int, str, bool]:
             time.sleep(0.4)
-            return 0, 0, "osm-api"
+            return 0, 0, "osm-api", False
 
         def slow_did(*_args, **_kwargs) -> tuple[bool, str]:
             time.sleep(0.4)
@@ -238,9 +243,9 @@ class CheckInfrastructureTests(unittest.TestCase):
     def test_total_timeout_returns_safe_defaults(self) -> None:
         """全体の時間切れでは 504 ではなく「判定不能」の既定値を返すこと。"""
 
-        def hanging_counts(*_args, **_kwargs) -> tuple[int, int, str]:
+        def hanging_counts(*_args, **_kwargs) -> tuple[int, int, str, bool]:
             time.sleep(2.0)
-            return 0, 0, "osm-api"
+            return 0, 0, "osm-api", False
 
         with patch.object(main, "INFRA_TOTAL_TIMEOUT_SECONDS", 0.5), patch.object(
             main, "INFRA_DEADLINE_SECONDS", 0.4
@@ -275,7 +280,7 @@ class CheckInfrastructureTests(unittest.TestCase):
         with patch.object(main, "INFRA_TOTAL_TIMEOUT_SECONDS", 0.8), patch.object(
             main, "INFRA_DEADLINE_SECONDS", 0.7
         ), patch.object(
-            main, "_fetch_infra_counts", return_value=(2, 1, "osm-api")
+            main, "_fetch_infra_counts", return_value=(2, 1, "osm-api", False)
         ), patch(
             "legal.fetch_did_status", side_effect=slow_did
         ):
@@ -350,6 +355,158 @@ class CheckInfrastructureTests(unittest.TestCase):
         connect, read = main._bounded_timeout(time.monotonic() - 10.0, 3.5, 9.0)
         self.assertEqual(connect, 0.5)
         self.assertEqual(read, 0.5)
+    # --- OSM 堅牢化（ミラー・リトライ・キャッシュ） -------------------------
+
+    def test_overpass_falls_back_to_next_mirror_on_timeout(self) -> None:
+        """先頭のミラーがタイムアウトしても、次のミラーで取得できること。"""
+
+        ok = FakeResponse(b'{"elements": []}')
+        urls = [
+            "https://overpass.invalid/api/interpreter",
+            "https://overpass2.invalid/api/interpreter",
+        ]
+        with patch.object(main, "OVERPASS_API_URLS", urls), patch(
+            "main.requests.post", side_effect=[requests.Timeout("slow"), ok]
+        ) as post, patch.object(
+            main, "_count_overpass_elements", return_value=(1, 0)
+        ):
+            counts = main._fetch_infra_once(
+                "overpass", LAT, LON, 300, time.monotonic() + 5.0
+            )
+
+        self.assertEqual(counts, (1, 0))
+        self.assertEqual(post.call_count, 2)
+        # 1つ目で諦めず、2つ目の URL を試している。
+        self.assertEqual(post.call_args_list[1].args[0], urls[1])
+        # 全ミラーが失敗したわけではないのでブレーカーは開かない。
+        self.assertEqual(main._OVERPASS_DOWN_UNTIL, 0.0)
+
+    def test_overpass_mirror_timeout_leaves_room_for_fallback(self) -> None:
+        """先頭ミラーが残り時間を使い切らず、次へ回す余裕を残すこと。"""
+
+        deadline = time.monotonic() + 4.5
+
+        first_connect, first_read = main._overpass_mirror_timeout(deadline, 3)
+        last_connect, last_read = main._overpass_mirror_timeout(deadline, 1)
+
+        # 3 台中の 1 台目は残り時間の 6 割まで（4.5 * 0.6 = 2.7 秒）。
+        self.assertAlmostEqual(first_read, 2.7, delta=0.3)
+        self.assertLessEqual(first_connect, first_read)
+        # 最後の 1 台は残り時間をすべて使う（上限は OVERPASS_REQUEST_TIMEOUT）。
+        self.assertGreater(last_read, first_read)
+        self.assertLessEqual(last_read, main.OVERPASS_REQUEST_TIMEOUT[1])
+
+    def test_transient_failure_is_retried(self) -> None:
+        """一時的な 503 は諦めずに再試行し、2回目で成功すること。"""
+
+        error = main._overpass_error("osm_api_unavailable", "busy", 503)
+        with patch.object(
+            main, "_fetch_osm_api_counts", side_effect=[error, (3, 2)]
+        ) as fetch:
+            towers, lines, source, cached = main._fetch_infra_counts(
+                LAT, LON, 300, time.monotonic() + 5.0
+            )
+
+        self.assertEqual((towers, lines, source), (3, 2, "osm-api"))
+        self.assertFalse(cached)
+        self.assertEqual(fetch.call_count, 2)
+
+    def test_retry_gives_up_after_attempts(self) -> None:
+        """再試行の上限に達したら次の取得元へ回ること。"""
+
+        error = main._overpass_error("osm_api_unavailable", "busy", 503)
+        with patch.object(
+            main, "_fetch_osm_api_counts", side_effect=error
+        ) as fetch, patch.object(
+            main,
+            "_request_overpass",
+            side_effect=main._overpass_error("overpass_unavailable", "down", 502),
+        ):
+            with self.assertRaises(HTTPException) as ctx:
+                main._fetch_infra_counts(LAT, LON, 300, time.monotonic() + 10.0)
+
+        self.assertEqual(ctx.exception.status_code, 502)
+        self.assertEqual(fetch.call_count, main.INFRA_RETRY_ATTEMPTS)
+
+    def test_retry_stops_when_deadline_is_too_close(self) -> None:
+        """残り時間が足りないときは待たずに次の取得元（Overpass）へ回す。"""
+
+        error = main._overpass_error("osm_api_unavailable", "busy", 503)
+        with patch.object(
+            main, "_fetch_osm_api_counts", side_effect=error
+        ) as fetch, patch.object(
+            main, "_request_overpass", return_value={"elements": []}
+        ), patch.object(main, "_count_overpass_elements", return_value=(0, 0)):
+            started = time.monotonic()
+            counts = main._fetch_infra_counts(LAT, LON, 300, started + 0.2)
+            elapsed = time.monotonic() - started
+
+        self.assertEqual(counts, (0, 0, "overpass", False))
+        self.assertEqual(fetch.call_count, 1)  # 再試行せずフォールバック
+        self.assertLess(elapsed, 0.2)
+
+    def test_permanent_failure_is_not_retried(self) -> None:
+        """範囲が広すぎる等の恒久的な失敗は再試行しないこと。"""
+
+        error = main._overpass_error("osm_api_area_too_large", "too large", 503)
+        with patch.object(
+            main, "_fetch_osm_api_counts", side_effect=error
+        ) as fetch, patch.object(
+            main,
+            "_request_overpass",
+            side_effect=main._overpass_error("overpass_unavailable", "down", 502),
+        ):
+            with self.assertRaises(HTTPException):
+                main._fetch_infra_counts(LAT, LON, 2000, time.monotonic() + 10.0)
+
+        # 2000m は Overpass が先。OSM API の再試行は行わない（1回だけ）。
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_repeated_check_uses_cache(self) -> None:
+        """同じエリアの再チェックは OSM を叩かず、cached=true で返すこと。"""
+
+        with patch("main._fetch_osm_api_counts", return_value=(2, 1)) as fetch:
+            first = main._fetch_infra_counts(LAT, LON, 300, time.monotonic() + 5.0)
+            second = main._fetch_infra_counts(LAT, LON, 300, time.monotonic() + 5.0)
+
+        self.assertEqual(first, (2, 1, "osm-api", False))
+        self.assertEqual(second, (2, 1, "osm-api", True))
+        self.assertEqual(fetch.call_count, 1)
+
+    def test_cache_hit_is_returned_via_endpoint(self) -> None:
+        """エンドポイント経由でも 2 回目は cached=true になること。"""
+
+        with patch(
+            "main.requests.get", return_value=FakeResponse(OSM_XML)
+        ), patch("main.requests.post"), patch(
+            "legal.fetch_did_status", return_value=(True, "テスト用のDID判定")
+        ):
+            first = self._get().json()
+            second = self._get().json()
+
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(second["towers_count"], 1)
+
+    def test_cache_expires(self) -> None:
+        """TTL を過ぎたキャッシュは使わないこと。"""
+
+        key = main._infra_cache_key(LAT, LON, 300)
+        with patch.object(main, "INFRA_CACHE_TTL_SECONDS", -1.0):
+            main._infra_cache_put(key, 5, 5, "osm-api")
+
+        self.assertIsNone(main._infra_cache_get(key))
+
+    def test_cache_key_rounds_coordinates(self) -> None:
+        """キーは小数第3位（約100m）で丸め、半径は区別すること。"""
+
+        base = main._infra_cache_key(35.628412, 139.738694, 300)
+        near = main._infra_cache_key(35.628388, 139.738711, 300)
+        far = main._infra_cache_key(35.640000, 139.738694, 300)
+
+        self.assertEqual(base, near)
+        self.assertNotEqual(base, far)
+        self.assertNotEqual(base, main._infra_cache_key(35.628412, 139.738694, 200))
 
 
 if __name__ == "__main__":

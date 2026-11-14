@@ -228,6 +228,17 @@ curl -sS -X POST -H 'Content-Type: application/json' \
 - 取得元の優先順
   - `radius` が `1000` 以下: 公式 OSM API（`/api/0.6/map`）を先に試し、失敗時のみ Overpass API
   - `radius` が `1000` 超: Overpass API を先に試し、失敗時のみ OSM API
+- OSM 取得の堅牢化
+  - **ミラー・フォールバック**: Overpass は既定で 3 ミラー（`overpass-api.de` →
+    `overpass.kumi.systems` → `overpass.private.coffee`）を順に試します。タイムアウト・
+    5xx・接続断でも諦めず、次の URL へ回します（`OVERPASS_API_URLS` で差し替え可）。
+  - **指数バックオフ再試行**: 一時的な失敗（混雑・5xx・接続断）は 0.4 秒 → 0.8 秒
+    （±15% のジッター、最大 `INFRA_RETRY_ATTEMPTS`＝既定 3 回）で再試行します。
+    待機＋次回試行が `INFRA_DEADLINE_SECONDS` に収まらない場合は待たずに次の取得元へ回します。
+    恒久的な失敗（`osm_api_area_too_large` など）は再試行しません。
+  - **メモリキャッシュ**: 同じエリア（緯度・経度を小数第3位＝約 100m に丸めた値＋半径）の
+    結果を `INFRA_CACHE_TTL_SECONDS`（既定 10 分）保持し、再チェック時は外部へ
+    問い合わせません。キャッシュから返した場合は `cached=true` になります。
 - 混雑・障害時: `502` / `503` / `504` + エラーコード（例: `overpass_busy`、`osm_api_area_too_large`）
 - 並列化と打ち切り（非同期）
   - エンドポイントは `async def` で、同期 HTTP クライアント（`requests`）による取得は
@@ -245,6 +256,7 @@ curl -sS -X POST -H 'Content-Type: application/json' \
 {
   "power_risk_detected": false,
   "power_unknown": false,
+  "cached": false,
   "towers_count": 0,
   "lines_count": 0,
   "message": "人口集中地区（DID）の上空のため特定飛行に該当します（カテゴリーⅡB以上）。周辺インフラ（送電線・鉄塔）の異常なし",
@@ -292,6 +304,7 @@ curl -sS -X POST -H 'Content-Type: application/json' \
 | `category_min` / `category_label` | 空域から決まる下限カテゴリー（`IIA` は空港周辺、`IIB` は DID 等） |
 | `legal_unknown` | `true` のときは DID を判定できていない（DIPS での確認が必要） |
 | `power_unknown` | `true` のときは送電線・鉄塔を判定できていない。`towers_count=0` は「0 件」ではなく「不明」 |
+| `cached` | `true` のときは同じエリア（約 100m 単位＋半径）のキャッシュを返した。`source` / 件数は前回取得した実データ |
 
 判定の考え方:
 
@@ -333,24 +346,39 @@ Overpass API は混雑時に `406` / `429` / `502` / `503` / `504` を返すか�
 20 秒無応答になる時間帯がありました）。そのため本 BFF は次のように動作します。
 
 1. 小半径（`1000m` 以下）は応答が速い OSM API を優先する（実測 1〜3 秒）。
-2. Overpass へ問い合わせる場合は 接続3秒・応答5秒で打ち切り、タイムアウトは再試行しない。
-   残り時間が `INFRA_DEADLINE_SECONDS` を下回っている場合は、その残り時間を上限にする。
-3. Overpass の失敗が確定したら 300 秒間は Overpass を試さない（サーキットブレーカー）。
-4. どちらも失敗した場合は、より具体的なエラー（`overpass_timeout` / `osm_api_area_too_large` など）を返す。
+2. Overpass へ問い合わせる場合は 接続3秒・応答5秒で打ち切り、残り時間が
+   `INFRA_DEADLINE_SECONDS` を下回っている場合は、その残り時間を上限にする。
+3. ミラー（既定 3 つ）を順に試し、タイムアウト・接続断・5xx でも次の URL へ回す。
+   先頭のミラーが残り時間を使い切らないよう、1 台あたりの応答上限は残り時間の 6 割
+   （下限 1.5 秒、最後の 1 台は残り時間すべて）に抑える。
+4. 一時的な失敗は指数バックオフ（0.4 → 0.8 秒、最大 3 回）で再試行する。
+   待機＋再試行が deadline に収まらない場合は待たずに次の取得元へ回す。
+5. 全ミラーで失敗したら 300 秒間は Overpass を試さない（サーキットブレーカー）。
+6. どちらも失敗した場合は、より具体的なエラー（`overpass_timeout` / `osm_api_area_too_large` など）を返す。
+
+同じエリアを再チェックしたときは、緯度・経度を小数第3位（約 100m）へ丸めた値と
+半径をキーにしたメモリキャッシュ（既定 TTL 10 分・最大 256 件）を返すため、
+外部 API の混雑の影響を受けません（`cached=true`）。
 
 OSM API の bbox は半径から自動計算し、BFF 側で点と線分の距離をメートル単位で
 評価します。ただし bbox 内の node が 5 万件を超えると OSM API は `400` を返すため、
 市街地の `radius` 1500m 以上では Overpass が必要です。
 
-ログには `source=overpass` / `source=osm-api` と `elapsed_ms` を出力します。
+ログには `source=overpass` / `source=osm-api` と `cached` / `elapsed_ms` を出力します。
 接続先は次の環境変数で変更できます。
 
 | 環境変数 | 既定値 | 用途 |
 |---|---|---|
-| `OVERPASS_API_URLS` | `https://overpass-api.de/api/interpreter` | カンマ区切りでミラーを順に試す（旧 `OVERPASS_API_URL` も可） |
+| `OVERPASS_API_URLS` | `overpass-api.de` → `kumi.systems` → `private.coffee` | カンマ区切りでミラーを順に試す（旧 `OVERPASS_API_URL` も可） |
 | `OSM_API_URL` | `https://api.openstreetmap.org/api/0.6/map` | OSM API の bbox 取得先 |
 | `INFRA_TOTAL_TIMEOUT_SECONDS` | `5.0` | `/api/check-infrastructure` 全体の上限（超過時は安全側の既定値へ縮退） |
 | `INFRA_DEADLINE_SECONDS` | `INFRA_TOTAL_TIMEOUT_SECONDS - 0.5` | 個々の取得元（OSM / Overpass / DID）に割り当てる時間 |
+| `INFRA_RETRY_ATTEMPTS` | `3` | 取得元ごとの最大試行回数（指数バックオフ） |
+| `INFRA_RETRY_BASE_SECONDS` | `0.4` | 再試行の初期待機秒（2 回目以降は倍々、上限 `INFRA_RETRY_MAX_SECONDS`） |
+| `INFRA_RETRY_MAX_SECONDS` | `2.0` | 再試行待機の上限秒 |
+| `INFRA_CACHE_TTL_SECONDS` | `600` | 周辺インフラ結果のキャッシュ保持秒 |
+| `INFRA_CACHE_MAX_ENTRIES` | `256` | キャッシュの最大件数（超過時は古い順に破棄） |
+| `INFRA_CACHE_PRECISION` | `3` | キャッシュキーの丸め桁（小数第3位 ≒ 100m） |
 
 ### `POST /api/parse-log`
 
@@ -618,7 +646,10 @@ DRONE_LOG_LIVE=1 .venv/bin/python -m unittest tests.test_infrastructure_live -v
 - `tests/test_check_infrastructure.py`: 取得元の切り替え・deadline・
   `asyncio` の並列実行（DID と OSM が直列にならないこと）・全体タイムアウト時の
   安全側の既定値（`power_unknown`）・DID だけが遅い場合の部分結果に加え、
-  DID 内 → ⅡB / 空港周辺 → ⅡA / DID 外 → Ⅰ / 判定不能 / 送電線のみ（安全上）
+  DID 内 → ⅡB / 空港周辺 → ⅡA / DID 外 → Ⅰ / 判定不能 / 送電線のみ（安全上）、
+  さらに Overpass ミラーのフォールバック・指数バックオフ再試行（成功／打ち切り／
+  deadline 不足時のスキップ）・恒久的エラーの再試行なし・キャッシュ
+  （ヒット／TTL 失効／キーの丸め）を検証
 - `tests/test_infrastructure_live.py`: 実 API（GSI / OSM）で品川駅・羽田・大雪山を検証。
   `DRONE_LOG_LIVE=1` を指定したときだけ実行。
 

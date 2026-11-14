@@ -24,7 +24,9 @@ import json
 import logging
 import math
 import os
+import random
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -113,22 +115,52 @@ GOOGLE_GEOCODE_TIMEOUT = (5.0, 8.0)
 # 待たされる割に成功率が低い。そのため既定では「小さい半径なら OSM API を
 # 先に試す」順序にしている（OSM API は 300m 程度の bbox なら数秒で返る）。
 # radius が OSM_API_PREFERRED_MAX_RADIUS を超えるときだけ Overpass を先に試す。
+# 既定のミラー。1 つが混雑・停止していても次へフォールバックできるよう複数持つ
+# （上から順に試す）。`OVERPASS_API_URLS` をカンマ区切りで設定すると差し替え可能。
+DEFAULT_OVERPASS_URLS = (
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+)
 OVERPASS_API_URLS = [
     url.strip()
     for url in (
         os.getenv("OVERPASS_API_URLS")
         or os.getenv("OVERPASS_API_URL")
-        or "https://overpass-api.de/api/interpreter"
+        or ",".join(DEFAULT_OVERPASS_URLS)
     ).split(",")
     if url.strip()
 ]
 # タイムアウトしたミラーを待ち続けないよう、接続3秒・応答5秒に抑える。
-# timeout はリトライしない（待ち時間が倍になるだけで成功率が上がらないため）。
+# ミラーは順に試し、応答が得られない場合は次の URL へ切り替える。
 OVERPASS_REQUEST_TIMEOUT = (3.0, 5.0)
 OVERPASS_TRANSIENT_STATUS = frozenset({406, 429, 502, 503, 504})
 # Overpass が落ちていると判定したら、この秒数だけ Overpass を試さない。
 OVERPASS_COOLDOWN_SECONDS = 300.0
 _OVERPASS_DOWN_UNTIL = 0.0
+
+# 一時的な失敗（混雑・5xx・接続断）に対する指数バックオフ再試行。
+#
+# 1回目 0.4 秒 → 2回目 0.8 秒（上限 2 秒、±15% のジッター付き）。待機＋次回試行が
+# 全体の deadline に収まらない場合は、待たずに次の取得元（OSM API ⇄ Overpass）へ
+# 回す。恒久的原因（範囲が広すぎる など）は再試行しない。
+INFRA_RETRY_ATTEMPTS = int(os.getenv("INFRA_RETRY_ATTEMPTS", "3"))
+INFRA_RETRY_BASE_SECONDS = float(os.getenv("INFRA_RETRY_BASE_SECONDS", "0.4"))
+INFRA_RETRY_MAX_SECONDS = float(os.getenv("INFRA_RETRY_MAX_SECONDS", "2.0"))
+# 再試行 1 回に最低限必要な残り時間（待機 + 1 回分の試行）。
+INFRA_RETRY_MIN_REMAINING_SECONDS = float(
+    os.getenv("INFRA_RETRY_MIN_REMAINING_SECONDS", "1.2")
+)
+INFRA_NON_RETRYABLE_CODES = frozenset(
+    {
+        "overpass_cooldown",
+        "overpass_invalid_response",
+        "osm_api_invalid_response",
+        "osm_api_area_too_large",
+        "infra_response_too_large",
+        "infra_deadline_exceeded",
+    }
+)
 
 # これ以下の半径は OSM API を優先する（bbox が小さく 50k node 制限に掛からない）。
 OSM_API_PREFERRED_MAX_RADIUS = 1000
@@ -153,6 +185,18 @@ INFRA_DEADLINE_SECONDS = float(
         str(max(1.0, INFRA_TOTAL_TIMEOUT_SECONDS - 0.5)),
     )
 )
+
+# 同じ場所を何度もチェックしたときに OSM を叩き続けないためのメモリキャッシュ。
+#
+# キーは緯度・経度を小数第3位（日本付近で約 90〜110m）へ丸めた値 + 半径。
+# 現場で座標を少し動かしても同じエリアならキャッシュに当たる。TTL を過ぎたら
+# 再取得する（送電線・鉄塔は短期間では変わらないため 10 分で十分）。
+INFRA_CACHE_TTL_SECONDS = float(os.getenv("INFRA_CACHE_TTL_SECONDS", "600"))
+INFRA_CACHE_MAX_ENTRIES = int(os.getenv("INFRA_CACHE_MAX_ENTRIES", "256"))
+INFRA_CACHE_PRECISION = int(os.getenv("INFRA_CACHE_PRECISION", "3"))
+_INFRA_CACHE: dict[tuple[float, float, int], tuple[float, int, int, str]] = {}
+# 保護するのは辞書操作のみ（数マイクロ秒）。ネットワーク I/O 中はロックを持たない。
+_INFRA_CACHE_LOCK = threading.Lock()
 
 # 応答本文の上限。OSM API は市街地の半径300mでも数MB（東京駅で約3.9MB）返す。
 # 想定外の巨大応答でメモリを消費しないよう上限を設ける。
@@ -299,6 +343,13 @@ class InfrastructureRisk(BaseModel):
         description=(
             "送電線・鉄塔の有無を判定できなかった（時間切れなど）。"
             "true のとき towers_count=0 は「0件」ではなく「不明」を意味する"
+        ),
+    )
+    cached: bool = Field(
+        False,
+        description=(
+            "同じエリア（緯度・経度を小数第3位で丸めた値＋半径）のキャッシュを"
+            "返したか。true でも source / counts は前回取得した実データ"
         ),
     )
 
@@ -581,6 +632,21 @@ def _bounded_timeout(
     return (min(connect, remaining), min(read, remaining))
 
 
+def _overpass_mirror_timeout(deadline: float, mirrors_left: int) -> tuple[float, float]:
+    """1 ミラーに割り当てる (connect, read) タイムアウトを返す。
+
+    残り時間を先頭のミラーが使い切ると、その 1 台が固まっただけで
+    フォールバックできなくなる。複数ミラーが残っているときは残り時間の 6 割を
+    上限にして、次へ回す余裕を残す（下限 1.5 秒・上限 `OVERPASS_REQUEST_TIMEOUT`）。
+    最後の 1 台は残り時間をすべて使う。
+    """
+
+    remaining = max(0.0, deadline - time.monotonic())
+    budget = remaining if mirrors_left <= 1 else remaining * 0.6
+    read_timeout = min(OVERPASS_REQUEST_TIMEOUT[1], max(1.5, budget))
+    return (min(OVERPASS_REQUEST_TIMEOUT[0], read_timeout), read_timeout)
+
+
 def _read_body_with_deadline(response: requests.Response, deadline: float) -> bytes:
     """応答本文をチャンクで読み、総時間が deadline を超えたら打ち切る。
 
@@ -631,7 +697,7 @@ def _request_overpass(query: str, deadline: float) -> dict[str, Any]:
     """Overpass API（`OVERPASS_API_URLS` の順）へクエリを送り、JSON を返す。
 
     混雑・クォータ超過時は 406/429/502/503/504 が返るため、次のミラーへ切り替える。
-    タイムアウトは待ち時間が倍になるだけで成功率が上がらないためリトライせず、
+    タイムアウト・接続断も同じく次のミラーへ回し、全ミラーが失敗したときだけ
     サーキットブレーカーを開いて以後のリクエストを OSM API へ回す。
     クエリ以外の個人情報は送信しない。
     """
@@ -644,8 +710,15 @@ def _request_overpass(query: str, deadline: float) -> dict[str, Any]:
         )
 
     last_status: int | None = None
+    last_error: HTTPException | None = None
+    attempted = False
 
-    for url in OVERPASS_API_URLS:
+    for index, url in enumerate(OVERPASS_API_URLS):
+        if time.monotonic() >= deadline:
+            # 全体の時間切れ。次のミラーを試しても間に合わない。
+            break
+        attempted = True
+        mirrors_left = len(OVERPASS_API_URLS) - index
         try:
             response = requests.post(
                 url,
@@ -654,17 +727,18 @@ def _request_overpass(query: str, deadline: float) -> dict[str, Any]:
                     "User-Agent": f"{SERVICE_NAME}/0.4.0",
                     "Accept": "application/json",
                 },
-                timeout=_bounded_timeout(deadline, *OVERPASS_REQUEST_TIMEOUT),
+                timeout=_overpass_mirror_timeout(deadline, mirrors_left),
                 stream=True,
             )
-        except requests.Timeout as exc:
+        except requests.Timeout:
+            # 1つのミラーが詰まっていても他は生きていることがあるため、次へ回す。
             logger.warning("overpass timeout: url=%s", url)
-            _mark_overpass_down("timeout")
-            raise _overpass_error(
+            last_error = _overpass_error(
                 "overpass_timeout",
                 "周辺インフラ情報の取得がタイムアウトしました。時間をおいて再試行してください。",
                 504,
-            ) from exc
+            )
+            continue
         except requests.RequestException as exc:
             logger.warning(
                 "overpass request failed: url=%s error=%s", url, type(exc).__name__
@@ -718,7 +792,23 @@ def _request_overpass(query: str, deadline: float) -> dict[str, Any]:
                 502,
             )
 
-    _mark_overpass_down(f"http_{last_status}" if last_status else "connection_failed")
+    if not attempted:
+        raise _overpass_error(
+            "infra_deadline_exceeded",
+            "周辺インフラ情報の取得に時間がかかりすぎました。時間をおいて再試行してください。",
+            504,
+        )
+
+    # ここへ来るのは「試したミラーがすべて失敗した」場合のみ。
+    # 以後のリクエストがまた全ミラーを待たないようブレーカーを開く。
+    _mark_overpass_down(
+        "timeout"
+        if last_status is None and last_error is not None
+        else (f"http_{last_status}" if last_status else "connection_failed")
+    )
+    if last_error is not None and last_status is None:
+        # タイムアウト／接続断のみ（HTTP 応答が得られていない）。
+        raise last_error
     if last_status in (429, 503):
         raise _overpass_error(
             "overpass_busy",
@@ -1024,9 +1114,99 @@ async def get_backup() -> JSONResponse:
         )
     return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
 
+
+def _infra_cache_key(lat: float, lon: float, radius: int) -> tuple[float, float, int]:
+    """キャッシュのキー。緯度・経度を小数第 3 位（約 100m）へ丸める。"""
+
+    return (
+        round(lat, INFRA_CACHE_PRECISION),
+        round(lon, INFRA_CACHE_PRECISION),
+        radius,
+    )
+
+
+def _infra_cache_get(key: tuple[float, float, int]) -> tuple[int, int, str] | None:
+    """有効なキャッシュがあれば (鉄塔数, 送電線数, 取得元) を返す。"""
+
+    now = time.monotonic()
+    with _INFRA_CACHE_LOCK:
+        entry = _INFRA_CACHE.get(key)
+        if entry is None:
+            return None
+        expires_at, towers_count, lines_count, source = entry
+        if expires_at <= now:
+            _INFRA_CACHE.pop(key, None)
+            return None
+    logger.info(
+        "infra cache hit: lat=%.3f lon=%.3f radius=%d ttl_left=%.0fs source=%s",
+        key[0],
+        key[1],
+        key[2],
+        expires_at - now,
+        source,
+    )
+    return towers_count, lines_count, source
+
+
+def _infra_cache_put(
+    key: tuple[float, float, int],
+    towers_count: int,
+    lines_count: int,
+    source: str,
+) -> None:
+    """取得結果を TTL 付きでキャッシュする（上限超過は古い順に捨てる）。"""
+
+    expires_at = time.monotonic() + INFRA_CACHE_TTL_SECONDS
+    with _INFRA_CACHE_LOCK:
+        if len(_INFRA_CACHE) >= INFRA_CACHE_MAX_ENTRIES:
+            now = time.monotonic()
+            for stale in [k for k, v in _INFRA_CACHE.items() if v[0] <= now]:
+                _INFRA_CACHE.pop(stale, None)
+        while len(_INFRA_CACHE) >= INFRA_CACHE_MAX_ENTRIES:
+            # 挿入順の先頭＝最も古いエントリから捨てる（簡易 LRU 相当）。
+            _INFRA_CACHE.pop(next(iter(_INFRA_CACHE)), None)
+        _INFRA_CACHE[key] = (expires_at, towers_count, lines_count, source)
+
+
+def clear_infra_cache() -> int:
+    """キャッシュを空にし、削除した件数を返す（テスト・保守用）。"""
+
+    with _INFRA_CACHE_LOCK:
+        removed = len(_INFRA_CACHE)
+        _INFRA_CACHE.clear()
+    return removed
+
+
+def _retry_delay_seconds(attempt: int) -> float:
+    """指数バックオフ（attempt は 1 始まり）に ±15% のジッターを加えた待機秒。"""
+
+    delay = INFRA_RETRY_BASE_SECONDS * (2 ** (attempt - 1))
+    return min(INFRA_RETRY_MAX_SECONDS, delay) * random.uniform(0.85, 1.15)
+
+
+def _infra_error_code(exc: HTTPException) -> str:
+    """HTTPException の detail から PWA 向けのエラーコードを取り出す。"""
+
+    detail = exc.detail
+    if isinstance(detail, dict):
+        return str(detail.get("code") or "unknown")
+    return "unknown"
+
+
+def _fetch_infra_once(
+    provider: str, lat: float, lon: float, radius: int, deadline: float
+) -> tuple[int, int]:
+    """指定の取得元で鉄塔・送電線の件数を取得する（同期処理）。"""
+
+    if provider == "overpass":
+        payload = _request_overpass(_overpass_query(lat, lon, radius), deadline)
+        return _count_overpass_elements(payload)
+    return _fetch_osm_api_counts(lat, lon, radius, deadline)
+
+
 def _fetch_infra_counts(
     lat: float, lon: float, radius: int, deadline: float
-) -> tuple[int, int, str]:
+) -> tuple[int, int, str, bool]:
     """鉄塔・送電線の件数を取得する（同期処理・呼び出し側でスレッドへ逃がす）。
 
     半径が `OSM_API_PREFERRED_MAX_RADIUS` 以下なら、応答が速く安定している
@@ -1034,9 +1214,21 @@ def _fetch_infra_counts(
     これを逆にすると、混雑した Overpass で十数秒待たされてから OSM API に
     落ちるため、スマホ側で「固まった」ように見えてしまう。
 
+    同じエリア（緯度・経度を小数第 3 位で丸めた値＋半径）の結果が
+    `INFRA_CACHE_TTL_SECONDS` 以内にあれば、外部へは問い合わせずに返す。
+    一時的な失敗（混雑・5xx・接続断）は指数バックオフで
+    `INFRA_RETRY_ATTEMPTS` 回まで再試行し、deadline に収まらない場合は
+    待たずに次の取得元へ回す。
+
     Returns:
-        (鉄塔数, 送電線数, 取得元)。取得できなければ HTTPException を投げる。
+        (鉄塔数, 送電線数, 取得元, キャッシュヒットか)。
+        取得できなければ HTTPException を投げる。
     """
+
+    key = _infra_cache_key(lat, lon, radius)
+    cached = _infra_cache_get(key)
+    if cached is not None:
+        return cached[0], cached[1], cached[2], True
 
     providers = (
         ("overpass", "osm-api")
@@ -1046,34 +1238,55 @@ def _fetch_infra_counts(
     failures: list[HTTPException] = []
 
     for provider in providers:
-        if time.monotonic() >= deadline:
-            logger.warning(
-                "check-infrastructure deadline exceeded before provider=%s", provider
-            )
-            break
-        try:
-            if provider == "overpass":
-                payload = _request_overpass(
-                    _overpass_query(lat, lon, radius), deadline
+        for attempt in range(1, INFRA_RETRY_ATTEMPTS + 1):
+            if time.monotonic() >= deadline:
+                logger.warning(
+                    "check-infrastructure deadline exceeded: provider=%s attempt=%d",
+                    provider,
+                    attempt,
                 )
-                towers_count, lines_count = _count_overpass_elements(payload)
-            else:
-                towers_count, lines_count = _fetch_osm_api_counts(
-                    lat, lon, radius, deadline
+                break
+            try:
+                towers_count, lines_count = _fetch_infra_once(
+                    provider, lat, lon, radius, deadline
                 )
-        except HTTPException as exc:
-            if exc.status_code not in (502, 503, 504):
-                raise
-            code = exc.detail.get("code") if isinstance(exc.detail, dict) else "unknown"
-            logger.warning(
-                "infra provider failed: provider=%s status=%d code=%s; trying fallback",
-                provider,
-                exc.status_code,
-                code,
-            )
-            failures.append(exc)
-            continue
-        return towers_count, lines_count, provider
+            except HTTPException as exc:
+                if exc.status_code not in (502, 503, 504):
+                    raise
+                code = _infra_error_code(exc)
+                logger.warning(
+                    "infra provider failed: provider=%s attempt=%d/%d status=%d code=%s",
+                    provider,
+                    attempt,
+                    INFRA_RETRY_ATTEMPTS,
+                    exc.status_code,
+                    code,
+                )
+                retryable = code not in INFRA_NON_RETRYABLE_CODES
+                if provider == "overpass" and not _overpass_available():
+                    # ブレーカーが開いている間は再試行しても即失敗する。
+                    retryable = False
+                delay = _retry_delay_seconds(attempt)
+                remaining = deadline - time.monotonic()
+                if (
+                    not retryable
+                    or attempt >= INFRA_RETRY_ATTEMPTS
+                    or remaining < delay + INFRA_RETRY_MIN_REMAINING_SECONDS
+                ):
+                    failures.append(exc)
+                    break
+                logger.info(
+                    "infra retry: provider=%s next_attempt=%d delay=%.2fs remaining=%.1fs",
+                    provider,
+                    attempt + 1,
+                    delay,
+                    remaining,
+                )
+                time.sleep(delay)
+                continue
+
+            _infra_cache_put(key, towers_count, lines_count, provider)
+            return towers_count, lines_count, provider, False
 
     if failures:
         # 最後に失敗した取得元のエラーを PWA に返す（原因が最も具体的）。
@@ -1236,11 +1449,12 @@ async def check_infrastructure(
     towers_count = 0
     lines_count = 0
     source = "unknown"
+    infra_cached = False
     if infra_task in done:
         try:
-            towers_count, lines_count, source = infra_task.result()
+            towers_count, lines_count, source, infra_cached = infra_task.result()
         except asyncio.CancelledError:  # pragma: no cover - 打ち切り時の競合
-            towers_count, lines_count, source = 0, 0, "unknown"
+            towers_count, lines_count, source, infra_cached = 0, 0, "unknown", False
         except HTTPException:
             raise
         except Exception as exc:  # pragma: no cover - 想定外の失敗
@@ -1301,7 +1515,8 @@ async def check_infrastructure(
 
     logger.info(
         "check-infrastructure: lat=%.6f lon=%.6f radius=%d towers=%d lines=%d "
-        "source=%s did=%s airport=%s distance_m=%s category=%s basis=%s elapsed_ms=%d",
+        "source=%s did=%s airport=%s distance_m=%s category=%s basis=%s "
+        "cached=%s elapsed_ms=%d",
         lat,
         lon,
         radius,
@@ -1313,6 +1528,7 @@ async def check_infrastructure(
         airport["distance_m"] if airport else "-",
         category_code,
         category_basis,
+        infra_cached,
         elapsed_ms,
     )
 
@@ -1322,6 +1538,7 @@ async def check_infrastructure(
         lines_count=lines_count,
         message=message,
         source=source,
+        cached=infra_cached,
         elapsed_ms=elapsed_ms,
         is_did=is_did,
         did_source=legal.DID_SOURCE,
