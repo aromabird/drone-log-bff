@@ -4,3 +4,7 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 data/
+# Gemini API キーなどの秘密情報（BFF 直下の .env）
+.env
+.env.*
+!.env.example

@@ -1,0 +1,31 @@
+{
+  "source": "conditions",
+  "flight": {
+    "date": "2026-11-14",
+    "takeoff_place": "千葉県香取市 小見川河川敷",
+    "landing_place": "千葉県香取市 小見川河川敷",
+    "lat": 35.9034,
+    "lng": 140.5089,
+    "takeoff_time": "09:00",
+    "landing_time": "09:20",
+    "duration_min": 20,
+    "purpose": "橋梁点検の空撮",
+    "specific_flags": ["DID", "150m", "目視外"],
+    "has_clear_zone": true
+  },
+  "weather": {
+    "text": "晴れ",
+    "temperature": 18.5,
+    "humidity": 55.0,
+    "precipitation": 0.0,
+    "wind_speed": 4.2,
+    "wind_gust": 8.4,
+    "safety_status": "CAUTION",
+    "safety_label": "突風が強いため注意"
+  },
+  "elevation": { "ground_elevation": 5.2, "max_150m_limit": 155.2, "note": "国土地理院の標高データ" },
+  "regulations": { "is_did": true, "note": "人口集中地区（DID）内", "source": "国土地理院 DID2020" },
+  "infrastructure": { "power_risk_detected": true, "towers_count": 2, "lines_count": 3, "message": "鉄塔2件・送電線3件を検出", "source": "osm-api" },
+  "drone": { "model_name": "DJI Mavic 3 Enterprise", "maker": "DJI", "weight_g": 920, "registration_no": "JU1234567890" },
+  "pilot": { "license_type": "一等無人航空機操縦士", "license_endorsements": ["目視外飛行", "夜間飛行"] }
+}

@@ -12,6 +12,10 @@ PWA がそのまま使える飛行サマリー JSON を返します。
 `GET /api/check-infrastructure` では、指定座標の周辺にある送電線・鉄塔を
 Overpass API（OpenStreetMap）から取得し、PWA のリスク判定用 JSON を返します。
 
+`POST /api/diagnose` では、飛行計画・気象・標高・DID・周辺インフラ・機体情報と
+任意の現場写真から、Gemini API で飛行前の安全診断文を生成します。API キーは
+BFF の環境変数（`.env`）だけで管理し、ブラウザへは渡しません。
+
 DJI の内部時刻は UTC で記録されるため、日付・離着陸時刻は必ず JST（UTC+9）へ
 変換して返します。アップロードされた内容はメモリ上で読み捨て、ディスクへ
 保存しません。
@@ -96,6 +100,26 @@ export DJI_API_KEY="<DJI Developer API Key>"
 
 キーは DJI のキーチェーン取得 API に送信されます。ログやレスポンスには
 出力しません。未設定時は Details の座標を使います。
+
+### AI 飛行前診断（Gemini）の設定
+
+`POST /api/diagnose` は Google の Gemini API（Generative Language API）を REST で
+呼びます。SDK は追加しません。
+
+```bash
+# drone-log-bff/.env（Git 管理外・パーミッション 600）
+GEMINI_API_KEY=<Google AI Studio で発行した API キー>
+GEMINI_MODEL=gemini-3.5-flash-lite   # 任意（既定値も同じ）
+```
+
+- `.env` は BFF 直下に置くと起動時に `python-dotenv` が読みます。launchd などで
+  環境変数を明示した場合は、そちらが優先されます。
+- キーはレスポンス・ログ・PWA へ出しません。ログは `source / model / 文字数 /
+  画像有無 / 処理時間` のみです。
+- 既定モデル `gemini-3.5-flash-lite` が提供終了した場合は、`GEMINI_MODEL` を
+  利用可能なモデル名へ変更してください（404 は `ai_model_not_found` を返します）。
+- 写真は `source="photo"` のときだけ送信します。PWA 側で長辺 1200px の JPEG に
+  圧縮し、BFF は base64 をそのまま Gemini へ渡します（ディスクへは保存しません）。
 
 ## API
 
@@ -295,6 +319,88 @@ Excel は `io.BytesIO` 上で生成し、レスポンス後はディスクに残
 試す場合は、同じ内容の JSON ファイルを用意するか、`--data-binary` のパスを
 `tests/export_sample.json` に合わせてください。
 
+### `POST /api/diagnose`
+
+飛行計画などから、Gemini による飛行前診断（プレーンテキスト）を生成します。
+キーは `GEMINI_API_KEY` を使用します（[AI 飛行前診断（Gemini）の設定](#ai-飛行前診断geminiの設定)）。
+
+リクエスト（`Content-Type: application/json`）:
+
+```jsonc
+{
+  "source": "conditions",          // conditions=周辺情報のみ / photo=現場写真も解析
+  "flight": {
+    "date": "2026-11-14",
+    "takeoff_place": "千葉県香取市 小見川河川敷",
+    "landing_place": "千葉県香取市 小見川河川敷",
+    "lat": 35.9034, "lng": 140.5089,
+    "takeoff_time": "09:00", "landing_time": "09:20",
+    "duration_min": 20,
+    "purpose": "橋梁点検の空撮",
+    "specific_flags": ["DID", "150m", "目視外"],
+    "has_clear_zone": true
+  },
+  "weather": {
+    "text": "晴れ", "temperature": 18.5, "humidity": 55.0,
+    "precipitation": 0.0, "wind_speed": 4.2, "wind_gust": 8.4,
+    "safety_status": "CAUTION", "safety_label": "突風が強いため注意"
+  },
+  "elevation": { "ground_elevation": 5.2, "max_150m_limit": 155.2, "note": "国土地理院" },
+  "regulations": { "is_did": true, "note": "DID内", "source": "国土地理院 DID2020" },
+  "infrastructure": {
+    "power_risk_detected": true, "towers_count": 2, "lines_count": 3,
+    "message": "鉄塔2件・送電線3件", "source": "osm-api"
+  },
+  "drone": {
+    "model_name": "DJI Mavic 3 Enterprise", "maker": "DJI",
+    "weight_g": 920, "registration_no": "JU1234567890"
+  },
+  "pilot": {
+    "license_type": "一等無人航空機操縦士",
+    "license_endorsements": ["目視外飛行", "夜間飛行"]
+  }
+}
+```
+
+`source="photo"` のときは `image_base64`（data URI 可）と `image_mime_type`
+（`image/jpeg` / `image/png` / `image/webp`）を指定します。写真は長辺 1200px の
+JPEG に圧縮済みのものを想定し、base64 で 8MB を超える入力は拒否します。
+
+レスポンス:
+
+```json
+{
+  "ok": true,
+  "diagnosis": "・総合判断: ...\n・突風への対策: ...\n最終判断は操縦者が行います。",
+  "model": "gemini-3.5-flash-lite",
+  "source": "conditions",
+  "generatedAt": "2026-11-14T18:13:29+09:00"
+}
+```
+
+`diagnosis` はプレーンテキストです。PWA は `textContent` で描画し、Markdown や
+HTML としては解釈しません。操縦者の氏名・連絡先は受け取らず、Gemini へも
+送信しません（資格区分と限定解除のみ）。
+
+エラーは FastAPI の `detail` に `{code, message}` を返します。
+
+| ステータス | code | 意味 |
+|---|---|---|
+| 503 | `ai_not_configured` | `GEMINI_API_KEY` 未設定 |
+| 503 | `ai_auth_error` | キーが無効（401/403） |
+| 503 | `ai_model_not_found` | `GEMINI_MODEL` が利用不可（404） |
+| 503 | `ai_rate_limited` | クォータ超過（429） |
+| 502 | `ai_upstream_error` | Gemini 側の 5xx・想定外ステータス |
+| 502 | `ai_invalid_request` | Gemini がリクエストを拒否（400） |
+| 502 | `ai_invalid_response` | 応答が JSON でない |
+| 502 | `ai_empty_response` | 生成テキストが空 |
+| 504 | `ai_timeout` | 接続5秒・応答30秒を超過 |
+| 422 | `image_required` | `source="photo"` なのに画像が無い |
+| 422 | `invalid_image_type` | 未対応の MIME タイプ |
+| 422 | `invalid_image_data` | base64 を復号できない |
+| 422 | `ai_blocked` | 安全フィルタで生成がブロックされた |
+| 413 | `image_too_large` | base64 が上限（8MB）超過 |
+
 ## 解析仕様
 
 - **日時**: `Details.start_time`（UTC aware）を JST に変換。`date` は離陸日。
@@ -341,11 +447,21 @@ cd drone-log-bff
 7. CORS プリフライト（許可オリジンのエコー / 許可外オリジンの拒否）
 8. 飛行日誌 Excel の生成（セル値・Content-Type・ファイル名）
 9. 周辺インフラ API の入力バリデーション（緯度91 → 422）
+10. AI 診断の入力バリデーション（`source=photo` で画像なし → 422 / `image_required`）
+11. AI 診断の実呼び出し（Gemini / `conditions`）— `GEMINI_API_KEY` 未設定時は SKIP
 
 `GET /api/check-infrastructure` の実データ取得は外部 API（Overpass / OSM API）へ
 アクセスするため、`smoke_test.sh` には含めていません。手元では上記の curl 例で確認してください。
 Overpass が混雑している場合は、OSM API フォールバックにより 20〜40 秒ほど
 かかることがあります。
+
+Gemini を呼ばないオフラインのユニットテストは `tests/test_diagnose.py` です
+（`_request_gemini_text` をモックし、正常系・画像検証・エラー対応を確認）。
+
+```bash
+cd drone-log-bff
+.venv/bin/python tests/test_diagnose.py -v
+```
 
 ### バックアップAPIのテスト
 

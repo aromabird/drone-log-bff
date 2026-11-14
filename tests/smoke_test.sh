@@ -288,4 +288,72 @@ assert isinstance(data.get("detail"), list), data
 print("   check-infrastructure validation OK: 422")
 PY
 
+DIAGNOSE_JSON="$ROOT_DIR/tests/diagnose_conditions.json"
+AI_CONFIGURED=0
+if [ -n "${GEMINI_API_KEY:-}" ]; then
+  AI_CONFIGURED=1
+elif [ -f "$ROOT_DIR/.env" ] && grep -Eq '^GEMINI_API_KEY=.+' "$ROOT_DIR/.env"; then
+  AI_CONFIGURED=1
+fi
+
+echo "10) diagnose validation (photo without image)"
+if [ "$AI_CONFIGURED" != "1" ]; then
+  echo "   SKIP: GEMINI_API_KEY が未設定です（AI診断は 503 ai_not_configured）。"
+else
+  STATUS="$(curl -sS --max-time 10 -o "$TMP_DIR/diagnose_invalid.json" -w '%{http_code}' \
+    -X POST \
+    -H "Content-Type: application/json" \
+    --data-binary '{"source":"photo"}' \
+    "$BASE_URL/api/diagnose")"
+  if [ "$STATUS" != "422" ]; then
+    echo "ERROR: 422 を期待しましたが $STATUS でした。" >&2
+    cat "$TMP_DIR/diagnose_invalid.json" >&2
+    exit 1
+  fi
+  "$PYTHON" - "$TMP_DIR/diagnose_invalid.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+detail = data.get("detail")
+assert isinstance(detail, dict), data
+assert detail.get("code") == "image_required", data
+print("   diagnose validation OK:", detail["code"])
+PY
+fi
+
+echo "11) diagnose real Gemini call (conditions)"
+if [ "$AI_CONFIGURED" != "1" ]; then
+  echo "   SKIP: GEMINI_API_KEY が未設定です。"
+elif [ ! -f "$DIAGNOSE_JSON" ]; then
+  echo "ERROR: $DIAGNOSE_JSON が見つかりません。" >&2
+  exit 1
+else
+  STATUS="$(curl -sS --max-time 55 -o "$TMP_DIR/diagnose.json" -w '%{http_code}' \
+    -X POST \
+    -H "Content-Type: application/json" \
+    --data-binary @"$DIAGNOSE_JSON" \
+    "$BASE_URL/api/diagnose")"
+  if [ "$STATUS" != "200" ]; then
+    echo "ERROR: 200 を期待しましたが $STATUS でした。" >&2
+    cat "$TMP_DIR/diagnose.json" >&2
+    exit 1
+  fi
+  "$PYTHON" - "$TMP_DIR/diagnose.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data.get("ok") is True, data
+assert data.get("source") == "conditions", data
+assert isinstance(data.get("model"), str) and data["model"], data
+assert isinstance(data.get("generatedAt"), str) and data["generatedAt"], data
+text = data.get("diagnosis")
+assert isinstance(text, str) and len(text) >= 20, data
+print(f"   diagnose OK: model={data['model']} chars={len(text)}")
+PY
+fi
+
 echo "ALL TESTS PASSED"
+
+
