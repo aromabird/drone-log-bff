@@ -118,8 +118,9 @@ GEMINI_MODEL=gemini-3.5-flash-lite   # 任意（既定値も同じ）
   画像有無 / 処理時間` のみです。
 - 既定モデル `gemini-3.5-flash-lite` が提供終了した場合は、`GEMINI_MODEL` を
   利用可能なモデル名へ変更してください（404 は `ai_model_not_found` を返します）。
-- 写真は `source="photo"` のときだけ送信します。PWA 側で長辺 1200px の JPEG に
-  圧縮し、BFF は base64 をそのまま Gemini へ渡します（ディスクへは保存しません）。
+- 写真は `source="photo"`、周辺マップは `source="map"` のときだけ送信します。
+  PWA 側で写真は長辺 1200px、地図は表示中の領域（`html2canvas`・2倍解像度）を
+  JPEG に変換し、BFF は base64 をそのまま Gemini へ渡します（ディスクへは保存しません）。
 
 ## API
 
@@ -328,7 +329,7 @@ Excel は `io.BytesIO` 上で生成し、レスポンス後はディスクに残
 
 ```jsonc
 {
-  "source": "conditions",          // conditions=周辺情報のみ / photo=現場写真も解析
+  "source": "map",                 // conditions=周辺情報のみ / photo=現場写真も解析 / map=周辺地図も解析
   "flight": {
     "date": "2026-11-14",
     "takeoff_place": "千葉県香取市 小見川河川敷",
@@ -362,9 +363,12 @@ Excel は `io.BytesIO` 上で生成し、レスポンス後はディスクに残
 }
 ```
 
-`source="photo"` のときは `image_base64`（data URI 可）と `image_mime_type`
-（`image/jpeg` / `image/png` / `image/webp`）を指定します。写真は長辺 1200px の
-JPEG に圧縮済みのものを想定し、base64 で 8MB を超える入力は拒否します。
+`source="photo"`（現場写真）または `source="map"`（周辺マップ）のときは
+`image_base64`（data URI 可）と `image_mime_type`（`image/jpeg` / `image/png` /
+`image/webp`）を指定します。写真は長辺 1200px、地図は 2 倍解像度の JPEG を想定し、
+base64 で 8MB を超える入力は拒否します。`source="map"` では「地図から読み取れる
+地形・道路・河川・建物密集・鉄塔/送電線」に触れ、人物・車両・距離は断定しないよう
+プロンプトを切り替えます。
 
 レスポンス:
 
@@ -395,7 +399,7 @@ HTML としては解釈しません。操縦者の氏名・連絡先は受け取
 | 502 | `ai_invalid_response` | 応答が JSON でない |
 | 502 | `ai_empty_response` | 生成テキストが空 |
 | 504 | `ai_timeout` | 接続5秒・応答30秒を超過 |
-| 422 | `image_required` | `source="photo"` なのに画像が無い |
+| 422 | `image_required` | `source="photo"` / `"map"` なのに画像が無い |
 | 422 | `invalid_image_type` | 未対応の MIME タイプ |
 | 422 | `invalid_image_data` | base64 を復号できない |
 | 422 | `ai_blocked` | 安全フィルタで生成がブロックされた |
@@ -447,7 +451,7 @@ cd drone-log-bff
 7. CORS プリフライト（許可オリジンのエコー / 許可外オリジンの拒否）
 8. 飛行日誌 Excel の生成（セル値・Content-Type・ファイル名）
 9. 周辺インフラ API の入力バリデーション（緯度91 → 422）
-10. AI 診断の入力バリデーション（`source=photo` で画像なし → 422 / `image_required`）
+10. AI 診断の入力バリデーション（`source=photo` / `source=map` で画像なし → 422 / `image_required`）
 11. AI 診断の実呼び出し（Gemini / `conditions`）— `GEMINI_API_KEY` 未設定時は SKIP
 
 `GET /api/check-infrastructure` の実データ取得は外部 API（Overpass / OSM API）へ

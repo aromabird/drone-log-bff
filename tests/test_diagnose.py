@@ -126,7 +126,7 @@ class DiagnoseEndpointTest(unittest.TestCase):
         self.assertIn("突風: 7.8m/s", captured["prompt"])
         self.assertIn("DID判定: DID内", captured["prompt"])
         self.assertIn("鉄塔数: 2件", captured["prompt"])
-        self.assertIn("添付写真: なし", captured["prompt"])
+        self.assertIn("添付画像: なし", captured["prompt"])
 
     def test_photo_success_passes_inline_image(self) -> None:
         captured: dict = {}
@@ -159,6 +159,47 @@ class DiagnoseEndpointTest(unittest.TestCase):
             response = client.post("/api/diagnose", json=payload)
         self.assertEqual(response.status_code, 422)
         self.assertEqual(detail_code(response), "image_required")
+
+    def test_map_success_passes_inline_image(self) -> None:
+        captured: dict = {}
+
+        def fake_gemini(prompt, image_base64, image_mime_type):
+            captured["prompt"] = prompt
+            captured["image"] = image_base64
+            captured["mime"] = image_mime_type
+            return "・総合判断: 周辺に建物密集。・河川沿いの進入経路に注意。"
+
+        payload = dict(BASE_PAYLOAD)
+        payload["source"] = "map"
+        payload["image_base64"] = "data:image/jpeg;base64," + PNG_BASE64
+        payload["image_mime_type"] = "image/jpeg"
+
+        with patch.object(main, "GEMINI_API_KEY", "test-key"), \
+                patch.object(main, "_request_gemini_text", side_effect=fake_gemini):
+            response = client.post("/api/diagnose", json=payload)
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["source"], "map")
+        self.assertEqual(captured["image"], PNG_BASE64)
+        self.assertEqual(captured["mime"], "image/jpeg")
+        self.assertIn("地図（国土地理院タイル）", captured["prompt"])
+        self.assertIn("添付地図から読み取れる地形", captured["prompt"])
+
+    def test_map_requires_image(self) -> None:
+        payload = dict(BASE_PAYLOAD)
+        payload["source"] = "map"
+        with patch.object(main, "GEMINI_API_KEY", "test-key"):
+            response = client.post("/api/diagnose", json=payload)
+        self.assertEqual(response.status_code, 422)
+        self.assertEqual(detail_code(response), "image_required")
+        self.assertIn("周辺地図", response.json()["detail"]["message"])
+
+    def test_unknown_source_is_rejected(self) -> None:
+        payload = dict(BASE_PAYLOAD)
+        payload["source"] = "drone-selfie"
+        with patch.object(main, "GEMINI_API_KEY", "test-key"):
+            response = client.post("/api/diagnose", json=payload)
+        self.assertEqual(response.status_code, 422)
 
     def test_rejects_unsupported_mime(self) -> None:
         payload = dict(BASE_PAYLOAD)

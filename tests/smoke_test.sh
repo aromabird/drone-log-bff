@@ -318,7 +318,29 @@ data = json.load(open(sys.argv[1], encoding="utf-8"))
 detail = data.get("detail")
 assert isinstance(detail, dict), data
 assert detail.get("code") == "image_required", data
-print("   diagnose validation OK:", detail["code"])
+print("   diagnose validation OK (photo):", detail["code"])
+PY
+
+  # 地図キャプチャが失敗した場合も同じ 422 で返る。
+  STATUS="$(curl -sS --max-time 10 -o "$TMP_DIR/diagnose_invalid_map.json" -w '%{http_code}' \
+    -X POST \
+    -H "Content-Type: application/json" \
+    --data-binary '{"source":"map"}' \
+    "$BASE_URL/api/diagnose")"
+  if [ "$STATUS" != "422" ]; then
+    echo "ERROR: 422 を期待しましたが $STATUS でした。" >&2
+    cat "$TMP_DIR/diagnose_invalid_map.json" >&2
+    exit 1
+  fi
+  "$PYTHON" - "$TMP_DIR/diagnose_invalid_map.json" <<'PY'
+import json
+import sys
+
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+detail = data.get("detail")
+assert isinstance(detail, dict), data
+assert detail.get("code") == "image_required", data
+print("   diagnose validation OK (map):", detail["code"])
 PY
 fi
 
