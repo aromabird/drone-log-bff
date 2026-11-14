@@ -229,13 +229,22 @@ curl -sS -X POST -H 'Content-Type: application/json' \
   - `radius` が `1000` 以下: 公式 OSM API（`/api/0.6/map`）を先に試し、失敗時のみ Overpass API
   - `radius` が `1000` 超: Overpass API を先に試し、失敗時のみ OSM API
 - 混雑・障害時: `502` / `503` / `504` + エラーコード（例: `overpass_busy`、`osm_api_area_too_large`）
-- 総処理時間が 9 秒を超えた場合は `504`（`infra_deadline_exceeded`）。
-  応答本文が細切れに届く場合もチャンク読み取り中に deadline を監視して打ち切るため、
-  クライアントが長時間待たされることはありません（PWA は 12 秒で打ち切り、無応答時は 1 回だけ自動再試行）。
+- 並列化と打ち切り（非同期）
+  - エンドポイントは `async def` で、同期 HTTP クライアント（`requests`）による取得は
+    `asyncio.to_thread` でスレッドへ逃がします。**OSM 取得と DID 判定は `asyncio.wait` で並列**に走ります。
+  - 全体の上限は `INFRA_TOTAL_TIMEOUT_SECONDS`（既定 **5 秒**）。取得元の個別上限は
+    `INFRA_DEADLINE_SECONDS`（既定 4.5 秒）で、原因が特定できている失敗（`502`/`503`/`504`）は
+    従来どおりエラーとして返します（PWA が再試行できるため）。
+  - 5 秒以内に応答が返らない（ハング等）場合は **504 を返さず `200` + 安全側の既定値**に縮退します。
+    `power_unknown=true`（鉄塔・送電線は「0 件」ではなく「不明」）、`legal_unknown=true`（DID 判定不能）を
+    立て、PWA は「異常なし」ではなく「判定不能」と表示します。空港周辺は同梱データから判定できるため、
+    時間切れでも `legal_flags` / `category_min` に反映します。
+  - PWA 側は 12 秒で打ち切り、無応答時は 10 秒で 1 回だけ自動再試行します（実機 5G の余裕を確保）。
 
 ```json
 {
   "power_risk_detected": false,
+  "power_unknown": false,
   "towers_count": 0,
   "lines_count": 0,
   "message": "人口集中地区（DID）の上空のため特定飛行に該当します（カテゴリーⅡB以上）。周辺インフラ（送電線・鉄塔）の異常なし",
@@ -282,6 +291,7 @@ curl -sS -X POST -H 'Content-Type: application/json' \
 | `specific_flight_basis` | `legal`（法令上）/ `safety`（安全上）/ `none` |
 | `category_min` / `category_label` | 空域から決まる下限カテゴリー（`IIA` は空港周辺、`IIB` は DID 等） |
 | `legal_unknown` | `true` のときは DID を判定できていない（DIPS での確認が必要） |
+| `power_unknown` | `true` のときは送電線・鉄塔を判定できていない。`towers_count=0` は「0 件」ではなく「不明」 |
 
 判定の考え方:
 
@@ -339,6 +349,8 @@ OSM API の bbox は半径から自動計算し、BFF 側で点と線分の距�
 |---|---|---|
 | `OVERPASS_API_URLS` | `https://overpass-api.de/api/interpreter` | カンマ区切りでミラーを順に試す（旧 `OVERPASS_API_URL` も可） |
 | `OSM_API_URL` | `https://api.openstreetmap.org/api/0.6/map` | OSM API の bbox 取得先 |
+| `INFRA_TOTAL_TIMEOUT_SECONDS` | `5.0` | `/api/check-infrastructure` 全体の上限（超過時は安全側の既定値へ縮退） |
+| `INFRA_DEADLINE_SECONDS` | `INFRA_TOTAL_TIMEOUT_SECONDS - 0.5` | 個々の取得元（OSM / Overpass / DID）に割り当てる時間 |
 
 ### `POST /api/parse-log`
 
@@ -591,19 +603,21 @@ cd drone-log-bff
 
 `GET /api/check-infrastructure` の送電線・鉄塔は外部 API（Overpass / OSM API）へ
 アクセスするため、`smoke_test.sh` では空域判定（DID / 空港）だけを確認しています。
-Overpass が混雑している場合は、OSM API フォールバックにより 20〜40 秒ほど
-かかることがあります。
+OSM 取得と DID 判定は並列に走り、全体は 5 秒で打ち切られるため、外部 API が
+混雑していても 5 秒以内に応答（または判定不能）が返ります。
 
 外部へ接続しないユニットテスト:
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v   # 全件（実 API テストは SKIP）
-DRONE_LOG_LIVE=1 .venv/bin/python tests/test_infrastructure_live.py -v
+.venv/bin/python -m unittest tests.test_legal tests.test_check_infrastructure -v
+DRONE_LOG_LIVE=1 .venv/bin/python -m unittest tests.test_infrastructure_live -v
 ```
 
 - `tests/test_legal.py`: PNG デコード（フィルタ0〜4）・タイル座標・
   DID の 404 / 不透明 / 透明 / タイムアウト・空港距離・カテゴリー判定
-- `tests/test_check_infrastructure.py`: 取得元の切り替え・deadline に加え、
+- `tests/test_check_infrastructure.py`: 取得元の切り替え・deadline・
+  `asyncio` の並列実行（DID と OSM が直列にならないこと）・全体タイムアウト時の
+  安全側の既定値（`power_unknown`）・DID だけが遅い場合の部分結果に加え、
   DID 内 → ⅡB / 空港周辺 → ⅡA / DID 外 → Ⅰ / 判定不能 / 送電線のみ（安全上）
 - `tests/test_infrastructure_live.py`: 実 API（GSI / OSM）で品川駅・羽田・大雪山を検証。
   `DRONE_LOG_LIVE=1` を指定したときだけ実行。

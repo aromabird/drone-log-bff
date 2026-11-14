@@ -7,6 +7,7 @@ OSM API / Overpass API へは接続せず、取得元の切り替えと「総処
 
 from __future__ import annotations
 
+import asyncio
 import sys
 import time
 import unittest
@@ -206,6 +207,87 @@ class CheckInfrastructureTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200, response.text)
         self.assertEqual(response.json()["source"], "overpass")
         post.assert_called_once()
+
+    def test_endpoint_is_async(self) -> None:
+        """同期 def のままだとスレッドプールを占有して詰まるため、async であること。"""
+
+        self.assertTrue(asyncio.iscoroutinefunction(main.check_infrastructure))
+
+    def test_did_and_osm_run_in_parallel(self) -> None:
+        """DID と OSM の取得が並列に走り、待ち時間が直列にならないこと。"""
+
+        def slow_counts(*_args, **_kwargs) -> tuple[int, int, str]:
+            time.sleep(0.4)
+            return 0, 0, "osm-api"
+
+        def slow_did(*_args, **_kwargs) -> tuple[bool, str]:
+            time.sleep(0.4)
+            return True, "テスト用のDID判定"
+
+        with patch.object(
+            main, "_fetch_infra_counts", side_effect=slow_counts
+        ), patch("legal.fetch_did_status", side_effect=slow_did):
+            response = self._get()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        # 直列なら 800ms 以上。BFF 側の計測が 600ms 未満なら並列に走っている。
+        self.assertLess(body["elapsed_ms"], 600, f"直列実行になっている: {body}")
+        self.assertTrue(body["is_did"])
+
+    def test_total_timeout_returns_safe_defaults(self) -> None:
+        """全体の時間切れでは 504 ではなく「判定不能」の既定値を返すこと。"""
+
+        def hanging_counts(*_args, **_kwargs) -> tuple[int, int, str]:
+            time.sleep(2.0)
+            return 0, 0, "osm-api"
+
+        with patch.object(main, "INFRA_TOTAL_TIMEOUT_SECONDS", 0.5), patch.object(
+            main, "INFRA_DEADLINE_SECONDS", 0.4
+        ), patch.object(
+            main, "_fetch_infra_counts", side_effect=hanging_counts
+        ), patch(
+            "legal.fetch_did_status", return_value=(None, "テスト用のDID判定")
+        ):
+            response = self._get()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        # 応答自体は打ち切り時刻（0.5 秒）で返る。打ち切った取得スレッドは
+        # requests の timeout で終わるまで残るが、レスポンスは待たない。
+        self.assertLess(body["elapsed_ms"], 1500, f"打ち切りが効いていない: {body}")
+        self.assertTrue(body["power_unknown"])
+        self.assertFalse(body["power_risk_detected"])
+        self.assertEqual(body["towers_count"], 0)
+        self.assertEqual(body["lines_count"], 0)
+        self.assertEqual(body["source"], "unknown")
+        self.assertTrue(body["legal_unknown"])
+        self.assertIsNone(body["is_did"])
+        self.assertIn("DIPS", body["message"])
+
+    def test_slow_did_does_not_block_infra_result(self) -> None:
+        """DID が遅くても、インフラ結果は返し DID だけ判定不能にすること。"""
+
+        def slow_did(*_args, **_kwargs) -> tuple[bool, str]:
+            time.sleep(2.0)
+            return True, "遅いDID判定"
+
+        with patch.object(main, "INFRA_TOTAL_TIMEOUT_SECONDS", 0.8), patch.object(
+            main, "INFRA_DEADLINE_SECONDS", 0.7
+        ), patch.object(
+            main, "_fetch_infra_counts", return_value=(2, 1, "osm-api")
+        ), patch(
+            "legal.fetch_did_status", side_effect=slow_did
+        ):
+            response = self._get()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        body = response.json()
+        self.assertEqual(body["towers_count"], 2)
+        self.assertEqual(body["lines_count"], 1)
+        self.assertFalse(body["power_unknown"])
+        self.assertIsNone(body["is_did"])
+        self.assertTrue(body["legal_unknown"])
 
     def test_both_providers_fail(self) -> None:
         with patch(

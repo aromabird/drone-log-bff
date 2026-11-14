@@ -25,7 +25,6 @@ import logging
 import math
 import os
 import re
-import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -134,16 +133,33 @@ _OVERPASS_DOWN_UNTIL = 0.0
 # これ以下の半径は OSM API を優先する（bbox が小さく 50k node 制限に掛からない）。
 OSM_API_PREFERRED_MAX_RADIUS = 1000
 
-# 1リクエストあたりの総処理時間の上限。超過したら 504 を返して PWA に委ねる。
-# PWA 側は12秒で打ち切るため、BFF が先に構造化エラーを返せるよう 9 秒に抑える。
-INFRA_DEADLINE_SECONDS = 9.0
+# 1リクエストあたりの総処理時間の上限。
+#
+# 同期 HTTP クライアント（requests）による取得は `asyncio.to_thread` で
+# スレッドへ逃がし、OSM API と DID タイルの取得を並列に走らせたうえで、
+# 全体を `asyncio.wait` で打ち切る。時間切れの場合は 504 ではなく
+# 「判定不能」を示す安全側の既定値へ縮退させる（スマホ側で固まらせない）。
+# 実測は OSM 1〜2.5 秒・DID 0.1〜1 秒のため、5 秒でも余裕がある。
+INFRA_TOTAL_TIMEOUT_SECONDS = float(
+    os.getenv("INFRA_TOTAL_TIMEOUT_SECONDS", "5.0")
+)
+
+# 個々の取得元（OSM / Overpass / DID）に割り当てる時間。全体より 0.5 秒短く
+# して、打ち切りが発火する前に取得側が構造化エラー（502/503/504）を返せる
+# ようにする（原因が特定できている失敗は PWA へ伝える）。
+INFRA_DEADLINE_SECONDS = float(
+    os.getenv(
+        "INFRA_DEADLINE_SECONDS",
+        str(max(1.0, INFRA_TOTAL_TIMEOUT_SECONDS - 0.5)),
+    )
+)
 
 # 応答本文の上限。OSM API は市街地の半径300mでも数MB（東京駅で約3.9MB）返す。
 # 想定外の巨大応答でメモリを消費しないよう上限を設ける。
 INFRA_MAX_RESPONSE_BYTES = 24 * 1024 * 1024
 
 # 空域判定（DID タイル取得）に割り当てる時間。OSM 取得と並列に走らせ、
-# 全体の INFRA_DEADLINE_SECONDS を超えないように短く打ち切る。
+# 全体の INFRA_TOTAL_TIMEOUT_SECONDS を超えないように短く打ち切る。
 INFRA_LEGAL_TIMEOUT_SECONDS = 3.0
 
 # Overpass が混雑・障害のときだけ使う公式 OSM API のフォールバック。
@@ -277,6 +293,13 @@ class InfrastructureRisk(BaseModel):
     )
     legal_unknown: bool = Field(
         False, description="DID を判定できなかった（DIPS での確認が必要）"
+    )
+    power_unknown: bool = Field(
+        False,
+        description=(
+            "送電線・鉄塔の有無を判定できなかった（時間切れなど）。"
+            "true のとき towers_count=0 は「0件」ではなく「不明」を意味する"
+        ),
     )
 
 
@@ -1001,68 +1024,25 @@ async def get_backup() -> JSONResponse:
         )
     return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
 
-
-@app.get(
-    "/api/check-infrastructure",
-    response_model=InfrastructureRisk,
-    summary="周辺の送電線・鉄塔と空域（DID・空港）を確認する",
-    responses={
-        422: {"description": "緯度・経度・半径の検証エラー"},
-        502: {"description": "Overpass API への接続失敗・不正な応答"},
-        503: {"description": "Overpass API の混雑"},
-        504: {"description": "Overpass API のタイムアウト"},
-    },
-)
-def check_infrastructure(
-    lat: float = Query(..., ge=-90.0, le=90.0, description="緯度"),
-    lon: float = Query(..., ge=-180.0, le=180.0, description="経度"),
-    radius: int = Query(300, ge=50, le=2000, description="検索半径（メートル）"),
-) -> InfrastructureRisk:
-    """指定座標の空域（DID・空港等の周辺）と周辺の鉄塔・送電線を判定する。
-
-    Overpass API の `power=tower`（node）と `power=line`（way）を対象にし、
-    1 つ以上あれば `power_risk_detected=true` を返す。あわせて国土地理院
-    DID2020 タイル（404 は DID 無し）と同梱の空港データから、特定飛行の
-    下限カテゴリー（`category_min`）を求める。PWA はこの結果で特定飛行の
-    チェックボックスとカテゴリー表示を更新する。
+def _fetch_infra_counts(
+    lat: float, lon: float, radius: int, deadline: float
+) -> tuple[int, int, str]:
+    """鉄塔・送電線の件数を取得する（同期処理・呼び出し側でスレッドへ逃がす）。
 
     半径が `OSM_API_PREFERRED_MAX_RADIUS` 以下なら、応答が速く安定している
     公式 OSM API を先に試し、失敗時のみ Overpass へフォールバックする。
     これを逆にすると、混雑した Overpass で十数秒待たされてから OSM API に
     落ちるため、スマホ側で「固まった」ように見えてしまう。
+
+    Returns:
+        (鉄塔数, 送電線数, 取得元)。取得できなければ HTTPException を投げる。
     """
-
-    started = time.monotonic()
-    deadline = started + INFRA_DEADLINE_SECONDS
-
-    # DID（人口集中地区）の判定はタイル1枚の取得なので、OSM 取得と並列に走らせる。
-    # GSI が遅い場合に備えて did_deadline で打ち切り、判定不能（null）として扱う。
-    did_deadline = min(deadline, started + INFRA_LEGAL_TIMEOUT_SECONDS)
-    did_result: dict[str, Any] = {
-        "is_did": None,
-        "did_note": legal.DID_NOTE_TIMEOUT,
-    }
-
-    def _fetch_did() -> None:
-        try:
-            is_did, note = legal.fetch_did_status(lat, lon, did_deadline)
-        except Exception:  # pragma: no cover - 空域判定の失敗で本処理を止めない
-            logger.exception("DID check failed unexpectedly")
-            is_did, note = None, legal.DID_NOTE_UNKNOWN
-        did_result["is_did"] = is_did
-        did_result["did_note"] = note
-
-    did_thread = threading.Thread(target=_fetch_did, name="did-check", daemon=True)
-    did_thread.start()
 
     providers = (
         ("overpass", "osm-api")
         if radius > OSM_API_PREFERRED_MAX_RADIUS
         else ("osm-api", "overpass")
     )
-    towers_count = 0
-    lines_count = 0
-    source = "unknown"
     failures: list[HTTPException] = []
 
     for provider in providers:
@@ -1081,8 +1061,6 @@ def check_infrastructure(
                 towers_count, lines_count = _fetch_osm_api_counts(
                     lat, lon, radius, deadline
                 )
-            source = provider
-            break
         except HTTPException as exc:
             if exc.status_code not in (502, 503, 504):
                 raise
@@ -1094,23 +1072,191 @@ def check_infrastructure(
                 code,
             )
             failures.append(exc)
+            continue
+        return towers_count, lines_count, provider
+
+    if failures:
+        # 最後に失敗した取得元のエラーを PWA に返す（原因が最も具体的）。
+        raise failures[-1]
+    raise _overpass_error(
+        "infra_deadline_exceeded",
+        "周辺インフラ情報の取得に時間がかかりすぎました。時間をおいて再試行してください。",
+        504,
+    )
+
+
+def _fetch_did_result(
+    lat: float, lon: float, deadline: float
+) -> tuple[bool | None, str]:
+    """DID 判定を安全に実行する（同期処理・呼び出し側でスレッドへ逃がす）。"""
+
+    try:
+        return legal.fetch_did_status(lat, lon, deadline)
+    except Exception:  # pragma: no cover - 空域判定の失敗で本処理を止めない
+        logger.exception("DID check failed unexpectedly")
+        return None, legal.DID_NOTE_UNKNOWN
+
+
+def _degraded_infra_result(
+    lat: float,
+    lon: float,
+    radius: int,
+    is_did: bool | None,
+    did_note: str,
+    started: float,
+) -> InfrastructureRisk:
+    """全体の時間切れで判定できなかったときの安全側の既定値を返す。
+
+    送電線・鉄塔の有無が分からない状態を「0 件」と混同しないよう
+    `power_unknown=true` を立てる（PWA が「異常なし」と誤認しないため）。
+    空港等の周辺は同梱データから即座に判定できるので、時間切れでも反映する。
+    """
+
+    airspace = legal.judge_airspace(lat, lon, is_did)
+    category_code, category_label, category_basis = legal.build_category(
+        airspace["legal_flags"], []
+    )
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    message = (
+        "周辺インフラと空域の確認が時間内に完了しませんでした。"
+        "送電線・鉄塔の有無と DID は判定できていません"
+        "（DIPS と現地確認で判断してください）。"
+    )
+    if airspace["legal_flags"]:
+        message += f"なお{'・'.join(airspace['category_reasons'])}のため特定飛行に該当します。"
+
+    logger.warning(
+        "check-infrastructure degraded: lat=%.6f lon=%.6f radius=%d did=%s "
+        "category=%s elapsed_ms=%d",
+        lat,
+        lon,
+        radius,
+        is_did,
+        category_code,
+        elapsed_ms,
+    )
+
+    return InfrastructureRisk(
+        power_risk_detected=False,
+        towers_count=0,
+        lines_count=0,
+        power_unknown=True,
+        message=message,
+        source="unknown",
+        elapsed_ms=elapsed_ms,
+        is_did=is_did,
+        did_source=legal.DID_SOURCE,
+        did_note=did_note,
+        is_airport_vicinity=airspace["is_airport_vicinity"],
+        airport=airspace["airport"],
+        legal_flags=airspace["legal_flags"],
+        safety_flags=[],
+        is_specific_flight=category_basis != "none",
+        specific_flight_basis=category_basis,
+        category_min=category_code,
+        category_label=category_label,
+        category_reasons=airspace["category_reasons"],
+        # DID まで判定できていた場合は「判定不能」にしない（空域は確定している）。
+        legal_unknown=is_did is None,
+    )
+
+
+
+
+@app.get(
+    "/api/check-infrastructure",
+    response_model=InfrastructureRisk,
+    summary="周辺の送電線・鉄塔と空域（DID・空港）を確認する",
+    responses={
+        422: {"description": "緯度・経度・半径の検証エラー"},
+        502: {"description": "Overpass API への接続失敗・不正な応答"},
+        503: {"description": "Overpass API の混雑"},
+        504: {"description": "Overpass API のタイムアウト"},
+    },
+)
+async def check_infrastructure(
+    lat: float = Query(..., ge=-90.0, le=90.0, description="緯度"),
+    lon: float = Query(..., ge=-180.0, le=180.0, description="経度"),
+    radius: int = Query(300, ge=50, le=2000, description="検索半径（メートル）"),
+) -> InfrastructureRisk:
+    """指定座標の空域（DID・空港等の周辺）と周辺の鉄塔・送電線を判定する。
+
+    Overpass API の `power=tower`（node）と `power=line`（way）を対象にし、
+    1 つ以上あれば `power_risk_detected=true` を返す。あわせて国土地理院
+    DID2020 タイル（404 は DID 無し）と同梱の空港データから、特定飛行の
+    下限カテゴリー（`category_min`）を求める。PWA はこの結果で特定飛行の
+    チェックボックスとカテゴリー表示を更新する。
+
+    半径が `OSM_API_PREFERRED_MAX_RADIUS` 以下なら、応答が速く安定している
+    公式 OSM API を先に試し、失敗時のみ Overpass へフォールバックする。
+    これを逆にすると、混雑した Overpass で十数秒待たされてから OSM API に
+    落ちるため、スマホ側で「固まった」ように見えてしまう。
+
+    Note:
+        同期 HTTP クライアント（requests）を使う取得処理は `asyncio.to_thread`
+        でスレッドへ逃がし、OSM 取得と DID 取得を `asyncio.wait` で並列に走らせる。
+        全体が `INFRA_TOTAL_TIMEOUT_SECONDS` を超えた場合は 504 を返さず、
+        `power_unknown` / `legal_unknown` を立てた安全側の既定値へ縮退する
+        （PWA 側が「異常なし」と誤認しないため）。
+    """
+
+    started = time.monotonic()
+    budget = max(0.5, INFRA_TOTAL_TIMEOUT_SECONDS)
+    infra_deadline = started + min(INFRA_DEADLINE_SECONDS, budget)
+    did_deadline = min(infra_deadline, started + INFRA_LEGAL_TIMEOUT_SECONDS)
+
+    # requests は同期 API のため、イベントループを塞がないようスレッドへ逃がす。
+    # 2 つの取得は互いに独立しているので、待ち時間が重ならないよう同時に開始する。
+    infra_task = asyncio.create_task(
+        asyncio.to_thread(_fetch_infra_counts, lat, lon, radius, infra_deadline)
+    )
+    did_task = asyncio.create_task(
+        asyncio.to_thread(_fetch_did_result, lat, lon, did_deadline)
+    )
+
+    remaining = max(0.0, budget - (time.monotonic() - started))
+    done, pending = await asyncio.wait({infra_task, did_task}, timeout=remaining)
+    for task in pending:  # 全体の時間切れ。取得スレッドは自前の timeout で終わる。
+        task.cancel()
+
+    # DID（空域）の判定不能は本処理を止めない。
+    is_did: bool | None = None
+    did_note = legal.DID_NOTE_TIMEOUT
+    if did_task in done:
+        try:
+            is_did, did_note = did_task.result()
+        except asyncio.CancelledError:  # pragma: no cover - 打ち切り時の競合
+            is_did, did_note = None, legal.DID_NOTE_TIMEOUT
+        except Exception:  # pragma: no cover - 想定外の失敗で本処理を止めない
+            logger.exception("DID check failed unexpectedly")
+            is_did, did_note = None, legal.DID_NOTE_UNKNOWN
+
+    # インフラ（送電線・鉄塔）。取得元が特定できている失敗は従来どおりエラーを返し、
+    # 応答が返らないまま時間切れになった場合だけ安全側の既定値へ縮退する。
+    towers_count = 0
+    lines_count = 0
+    source = "unknown"
+    if infra_task in done:
+        try:
+            towers_count, lines_count, source = infra_task.result()
+        except asyncio.CancelledError:  # pragma: no cover - 打ち切り時の競合
+            towers_count, lines_count, source = 0, 0, "unknown"
+        except HTTPException:
+            raise
+        except Exception as exc:  # pragma: no cover - 想定外の失敗
+            logger.exception("infra check failed unexpectedly")
+            raise _overpass_error(
+                "infra_unavailable",
+                "周辺インフラ情報を取得できませんでした。時間をおいて再試行してください。",
+                502,
+            ) from exc
 
     if source == "unknown":
-        if failures:
-            # 最後に失敗した取得元のエラーを PWA に返す（原因が最も具体的）。
-            raise failures[-1]
-        raise _overpass_error(
-            "infra_deadline_exceeded",
-            "周辺インフラ情報の取得に時間がかかりすぎました。時間をおいて再試行してください。",
-            504,
+        return _degraded_infra_result(
+            lat, lon, radius, is_did, did_note, started
         )
 
     power_risk_detected = towers_count > 0 or lines_count > 0
-
-    # DID タイルは OSM 取得と並列に走っているため、残り時間だけ待つ。
-    did_thread.join(max(0.0, deadline - time.monotonic()))
-    is_did = did_result["is_did"]
-    did_note = did_result["did_note"]
 
     airspace = legal.judge_airspace(lat, lon, is_did)
     airport = airspace["airport"]
