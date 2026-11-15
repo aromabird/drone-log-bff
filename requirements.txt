@@ -8,3 +8,6 @@ pydjirecord>=1.3.0,<2.0
 openpyxl>=3.1,<4.0
 requests>=2.32,<3.0
 python-dotenv>=1.0,<2.0
+# 気象データ取得の指数バックオフ再試行（純 Python・推移依存なし）
+# `wait_exponential_jitter(multiplier=...)` は tenacity 9.0 以降の名前。
+tenacity>=9.0,<10.0

@@ -7,6 +7,8 @@
 鉄塔を取得する（小半径は応答の速い OSM API を優先し、失敗時のみ Overpass）。
 あわせて国土地理院 DID2020 タイルから人口集中地区（DID）を、同梱の空港データ
 （OurAirports）から空港等の周辺を判定し、特定飛行の下限カテゴリーを返す。
+`GET /api/weather` では気象庁アメダス（主系）と Open-Meteo（代替）から、
+現場の風速・風向・天候・気温を取得する。
 
 解析には `pydjirecord` を使う。DJI の内部時刻は UTC で記録されるため、
 レスポンスは必ず JST（UTC+9）へ変換する。v13 以降のフレーム（GPS 軌跡）は
@@ -33,7 +35,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Callable, Literal
 
 import requests
 from dotenv import load_dotenv
@@ -43,6 +45,12 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from openpyxl import load_workbook
 from pydantic import BaseModel, ConfigDict, Field
 from pydjirecord import DJILog
+from tenacity import (
+    Retrying,
+    retry_if_exception,
+    stop_after_attempt,
+    wait_exponential_jitter,
+)
 
 import legal
 
@@ -108,6 +116,66 @@ GOOGLE_MAPS_API_KEY = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
 GOOGLE_GEOCODE_URL = "https://maps.googleapis.com/maps/api/geocode/json"
 # 接続5秒・応答8秒。PWA 側は12秒で打ち切るため、BFF が先にタイムアウトを返す。
 GOOGLE_GEOCODE_TIMEOUT = (5.0, 8.0)
+
+# 気象（気象庁アメダス / Open-Meteo）。
+#
+# PWA は以前 Open-Meteo を直接叩いていたが、モバイル回線では散発的に
+# タイムアウトし、標高・DID まで巻き添えで失敗していた。そのため気象だけを
+# BFF に集約する。主系は気象庁アメダス（国内・公的・10分更新の実測値で、
+# 実測 0.1〜0.3 秒）。代替は Open-Meteo（突風と WMO 天候コードが取れるが、
+# 経路によっては TLS で停止することを実測で確認しているため主系にしない）。
+# URL はテスト・障害時の切り分け用に環境変数で差し替えられる。
+JMA_AMEDAS_LATEST_URL = os.getenv(
+    "JMA_AMEDAS_LATEST_URL",
+    "https://www.jma.go.jp/bosai/amedas/data/latest_time.txt",
+).strip()
+JMA_AMEDAS_MAP_URL = os.getenv(
+    "JMA_AMEDAS_MAP_URL",
+    "https://www.jma.go.jp/bosai/amedas/data/map/{ts}.json",
+).strip()
+JMA_AMEDAS_TABLE_URL = os.getenv(
+    "JMA_AMEDAS_TABLE_URL",
+    "https://www.jma.go.jp/bosai/amedas/const/amedastable.json",
+).strip()
+OPEN_METEO_URL = os.getenv(
+    "OPEN_METEO_URL",
+    "https://api.open-meteo.com/v1/forecast",
+).strip()
+
+# 接続3秒・応答4秒。全体 deadline（既定8秒）と PWA 側の打ち切り（12秒）より
+# 短くして、BFF が先に構造化エラーを返せるようにする。
+WEATHER_JMA_TIMEOUT = (3.0, 4.0)
+WEATHER_OPEN_METEO_TIMEOUT = (3.0, 4.0)
+# 1リクエストで気象取得に使う総時間の上限。超えたら残りの取得元を試さない。
+WEATHER_DEADLINE_SECONDS = float(os.getenv("WEATHER_DEADLINE_SECONDS", "8.0"))
+# 一時的な失敗（タイムアウト・接続断・5xx）に対する指数バックオフ再試行。
+# 1回目の待機 0.25 秒 → 0.5 秒（上限 0.75 秒、ジッター付き）。恒久的原因
+# （404・不正な応答）は再試行しない。
+WEATHER_RETRY_ATTEMPTS = int(os.getenv("WEATHER_RETRY_ATTEMPTS", "2"))
+WEATHER_RETRY_BASE_SECONDS = float(os.getenv("WEATHER_RETRY_BASE_SECONDS", "0.25"))
+WEATHER_RETRY_MAX_SECONDS = float(os.getenv("WEATHER_RETRY_MAX_SECONDS", "0.75"))
+# 再試行 1 回に最低限必要な残り時間（待機 + 1 回分の試行）。
+WEATHER_RETRY_MIN_REMAINING_SECONDS = 1.0
+# 同じ場所を連続で確認したときに観測所を叩き続けないためのメモリキャッシュ。
+# アメダスは 10 分更新なので 2 分で十分（現場で座標を微調整しても当たる）。
+WEATHER_CACHE_TTL_SECONDS = float(os.getenv("WEATHER_CACHE_TTL_SECONDS", "120"))
+WEATHER_CACHE_MAX_ENTRIES = int(os.getenv("WEATHER_CACHE_MAX_ENTRIES", "256"))
+# 緯度・経度を小数第3位（日本付近で約 90〜110m）へ丸めてキャッシュキーにする。
+WEATHER_CACHE_PRECISION = int(os.getenv("WEATHER_CACHE_PRECISION", "3"))
+# 全取得元が失敗しても、この秒数以内のキャッシュがあれば「参考値」として返す。
+# 山間部・離島で通信が不安定なときに画面を空にしないための安全側の縮退。
+WEATHER_STALE_MAX_SECONDS = float(os.getenv("WEATHER_STALE_MAX_SECONDS", "1800"))
+# 観測所表（1286 観測所・約 188KB）は 1 日に 1 回で十分。
+JMA_AMEDAS_TABLE_TTL_SECONDS = float(
+    os.getenv("JMA_AMEDAS_TABLE_TTL_SECONDS", "86400")
+)
+# アメダスは最新時刻のファイルが未生成なことがあるため、10 分前まで遡る。
+JMA_AMEDAS_MAX_SLOT_FALLBACK = 3
+_WEATHER_CACHE: dict[tuple[float, float], dict[str, Any]] = {}
+_WEATHER_CACHE_LOCK = threading.Lock()
+_AMEDAS_TABLE: dict[str, dict[str, Any]] = {}
+_AMEDAS_TABLE_FETCHED_AT = 0.0
+_AMEDAS_TABLE_LOCK = threading.Lock()
 
 # 周辺インフラ（送電線・鉄塔）の取得設定。
 #
@@ -227,8 +295,9 @@ app = FastAPI(
         "離陸地点を返します。飛行日誌の Excel（様式1）も生成できます。"
         "周辺の送電線・鉄塔は Overpass API から取得します。"
         "AI 飛行前診断は Gemini API を BFF 経由で呼び出します。"
+        "現在の気象（風・天候）は気象庁アメダスを主系に取得します。"
     ),
-    version="0.5.0",
+    version="0.6.0",
 )
 
 # CORS は「PWA の配信元」と「ローカル開発」だけに限定する。
@@ -1788,6 +1857,878 @@ def reverse_geocode(
     )
 
 
+# ---------------------------------------------------------------------------
+# 気象（気象庁アメダス / Open-Meteo）
+# ---------------------------------------------------------------------------
+
+
+class WeatherFetchError(Exception):
+    """気象データ取得の失敗。
+
+    `code` / `status_code` はそのまま PWA へ返し、`transient` は再試行の可否を
+    表す（タイムアウト・接続断・5xx は再試行、404 や不正な応答は再試行しない）。
+    """
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        transient: bool,
+        status_code: int = 502,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.transient = transient
+        self.status_code = status_code
+
+
+def _weather_error(status_code: int, code: str, message: str) -> HTTPException:
+    """PWA がそのまま表示できる構造化エラーを返す。"""
+
+    return HTTPException(
+        status_code=status_code,
+        detail={"code": code, "message": message},
+    )
+
+
+def _weather_timeout(deadline: float, base: tuple[float, float]) -> tuple[float, float]:
+    """残り時間に収まるよう接続・応答のタイムアウトを縮める。"""
+
+    remaining = max(1.0, deadline - time.monotonic())
+    connect = min(base[0], max(0.8, remaining * 0.4))
+    read = min(base[1], max(1.0, remaining * 0.6))
+    return (connect, read)
+
+
+def _weather_get(
+    url: str,
+    timeout: tuple[float, float],
+    label: str,
+    params: dict[str, Any] | None = None,
+) -> Any:
+    """気象 API の GET。失敗は再試行可否つきの WeatherFetchError へ変換する。"""
+
+    try:
+        response = requests.get(url, params=params, timeout=timeout)
+    except requests.Timeout as exc:
+        raise WeatherFetchError(
+            "weather_timeout",
+            f"{label}の応答がありません（タイムアウト）。",
+            transient=True,
+            status_code=504,
+        ) from exc
+    except requests.RequestException as exc:
+        raise WeatherFetchError(
+            "weather_unreachable",
+            f"{label}に接続できませんでした。",
+            transient=True,
+            status_code=502,
+        ) from exc
+
+    status = int(getattr(response, "status_code", 0) or 0)
+    if status == 404:
+        raise WeatherFetchError(
+            "weather_not_found",
+            f"{label}にデータがありません。",
+            transient=False,
+            status_code=502,
+        )
+    if status == 429 or status >= 500:
+        raise WeatherFetchError(
+            "weather_unavailable",
+            f"{label}が混雑しています。時間をおいて再試行してください。",
+            transient=True,
+            status_code=503,
+        )
+    if status >= 400:
+        raise WeatherFetchError(
+            "weather_upstream_error",
+            f"{label}の取得に失敗しました（HTTP {status}）。",
+            transient=False,
+            status_code=502,
+        )
+    return response
+
+
+def _weather_json(response: Any, label: str) -> Any:
+    """レスポンスを JSON として読む（壊れていれば再試行しないエラー）。"""
+
+    try:
+        return response.json()
+    except ValueError as exc:
+        raise WeatherFetchError(
+            "weather_invalid_response",
+            f"{label}の応答を読み取れませんでした。",
+            transient=False,
+            status_code=502,
+        ) from exc
+
+
+# Open-Meteo の WMO 天候コード → 日本語。PWA の weatherText() と表記を揃える。
+_WMO_WEATHER_TEXT: dict[int, str] = {
+    0: "快晴",
+    1: "晴れ",
+    2: "薄曇り",
+    3: "曇り",
+    45: "霧",
+    48: "着氷性の霧",
+    51: "弱い霧雨",
+    53: "霧雨",
+    55: "強い霧雨",
+    56: "着氷性の霧雨",
+    57: "強い着氷性の霧雨",
+    61: "弱い雨",
+    63: "雨",
+    65: "強い雨",
+    66: "着氷性の雨",
+    67: "強い着氷性の雨",
+    71: "弱い雪",
+    73: "雪",
+    75: "強い雪",
+    77: "雪粒",
+    80: "弱いにわか雨",
+    81: "にわか雨",
+    82: "激しいにわか雨",
+    85: "弱いにわか雪",
+    86: "強いにわか雪",
+    95: "雷雨",
+    96: "雷雨（ひょう）",
+    99: "強い雷雨（ひょう）",
+}
+
+# アメダスの風向コード。0 は静穏、1..16 は北北東から時計回りに北。
+_AMEDAS_WIND_LABELS = (
+    "静穏",
+    "北北東",
+    "北東",
+    "東北東",
+    "東",
+    "東南東",
+    "南東",
+    "南南東",
+    "南",
+    "南南西",
+    "南西",
+    "西南西",
+    "西",
+    "西北西",
+    "北西",
+    "北北西",
+    "北",
+)
+
+# 16 方位（北から時計回り）。Open-Meteo の角度を日本語へ変換する。
+_COMPASS_16 = (
+    "北",
+    "北北東",
+    "北東",
+    "東北東",
+    "東",
+    "東南東",
+    "南東",
+    "南南東",
+    "南",
+    "南南西",
+    "南西",
+    "西南西",
+    "西",
+    "西北西",
+    "北西",
+    "北北西",
+)
+
+
+def _round_optional(value: Any, digits: int = 1) -> float | None:
+    """数値を丸める（None・非数・NaN は None）。"""
+
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return round(number, digits)
+
+
+def _bearing_label(degrees: Any) -> str | None:
+    """角度（度）を 16 方位の日本語へ変換する。"""
+
+    number = _round_optional(degrees, 1)
+    if number is None:
+        return None
+    index = int((number % 360.0) / 22.5 + 0.5) % 16
+    return _COMPASS_16[index]
+
+
+def _amedas_wind_label(code: Any) -> str | None:
+    """アメダスの風向コードを日本語へ変換する。"""
+
+    number = _round_optional(code, 0)
+    if number is None:
+        return None
+    index = int(number)
+    if 0 <= index < len(_AMEDAS_WIND_LABELS):
+        return _AMEDAS_WIND_LABELS[index]
+    return None
+
+
+def _amedas_value(entry: Any, key: str) -> float | None:
+    """アメダスの `[値, 品質フラグ]` から有効な値だけを取り出す。
+
+    品質フラグが 0 以外（欠測・異常値・推定値など）のときは None を返す。
+    """
+
+    if not isinstance(entry, dict):
+        return None
+    raw = entry.get(key)
+    if not isinstance(raw, list) or not raw:
+        return None
+    if len(raw) > 1 and raw[1] not in (0, None):
+        return None
+    return _round_optional(raw[0])
+
+
+def _amedas_weather_text(
+    precipitation_1h: float | None,
+    snow_cm: float | None,
+    sun_1h: float | None,
+    temperature: float | None,
+) -> tuple[str, int]:
+    """アメダスの実測値から天候テキストと WMO 相当コードを推定する。
+
+    アメダスには天候そのものが無いため、降水量・積雪・日照時間から推定する
+    （雷・霧は判定できない）。PWA の飛行適性判定をそのまま使えるよう、
+    コードは Open-Meteo と同じ WMO 相当に揃える。
+    """
+
+    if snow_cm is not None and snow_cm > 0:
+        return ("雪", 73)
+    if precipitation_1h is not None and precipitation_1h >= 0.5:
+        if temperature is not None and temperature <= 1.0:
+            return ("雪", 73)
+        return ("雨", 63)
+    if precipitation_1h is not None and 0 < precipitation_1h < 0.5:
+        return ("弱い雨", 61)
+    if sun_1h is not None and sun_1h >= 0.6:
+        return ("晴れ", 1)
+    return ("曇り", 3)
+
+
+def _amedas_coordinate(raw: Any) -> float | None:
+    """アメダス観測所表の `[度, 分]` を十進度へ変換する。"""
+
+    if not isinstance(raw, list) or len(raw) < 2:
+        return None
+    try:
+        degrees = float(raw[0])
+        minutes = float(raw[1])
+    except (TypeError, ValueError):
+        return None
+    # 南緯・西経は「度」が負で返るため、符号はそのまま活かす。
+    sign = -1.0 if degrees < 0 else 1.0
+    return degrees + sign * minutes / 60.0
+
+
+def _parse_amedas_table(raw: Any) -> dict[str, dict[str, Any]]:
+    """観測所表を `{観測所ID: {lat, lon, name}}` へ変換する。"""
+
+    if not isinstance(raw, dict):
+        return {}
+
+    table: dict[str, dict[str, Any]] = {}
+    for station_id, entry in raw.items():
+        if not isinstance(entry, dict):
+            continue
+        lat = _amedas_coordinate(entry.get("lat"))
+        lon = _amedas_coordinate(entry.get("lon"))
+        if lat is None or lon is None:
+            continue
+        table[str(station_id)] = {
+            "lat": lat,
+            "lon": lon,
+            "name": str(entry.get("kjName") or "").strip(),
+        }
+    return table
+
+
+def _amedas_table(deadline: float) -> dict[str, dict[str, Any]]:
+    """観測所表を返す（プロセス内で 1 日キャッシュ）。"""
+
+    global _AMEDAS_TABLE, _AMEDAS_TABLE_FETCHED_AT
+
+    now = time.monotonic()
+    with _AMEDAS_TABLE_LOCK:
+        if (
+            _AMEDAS_TABLE
+            and now - _AMEDAS_TABLE_FETCHED_AT < JMA_AMEDAS_TABLE_TTL_SECONDS
+        ):
+            return _AMEDAS_TABLE
+
+    response = _weather_get(
+        JMA_AMEDAS_TABLE_URL,
+        _weather_timeout(deadline, WEATHER_JMA_TIMEOUT),
+        "気象庁の観測所表",
+    )
+    table = _parse_amedas_table(_weather_json(response, "気象庁の観測所表"))
+    if not table:
+        raise WeatherFetchError(
+            "weather_invalid_response",
+            "気象庁の観測所表を解釈できませんでした。",
+            transient=False,
+        )
+
+    with _AMEDAS_TABLE_LOCK:
+        _AMEDAS_TABLE = table
+        _AMEDAS_TABLE_FETCHED_AT = time.monotonic()
+    return table
+
+
+def _nearest_amedas_stations(
+    lat: float,
+    lon: float,
+    table: dict[str, dict[str, Any]],
+    limit: int = 5,
+) -> list[tuple[str, dict[str, Any], float]]:
+    """観測所を近い順に返す（風速を持つ観測所を選ぶため複数返す）。"""
+
+    distances = [
+        (
+            station_id,
+            station,
+            legal.haversine_m(lat, lon, station["lat"], station["lon"]),
+        )
+        for station_id, station in table.items()
+    ]
+    distances.sort(key=lambda item: item[2])
+    return distances[:limit]
+
+
+def _amedas_station_score(entry: Any) -> int:
+    """観測項目の充実度。ドローン判断に効く順に 風速 > 気温 > 降水量。"""
+
+    if not isinstance(entry, dict):
+        return -1
+    if "wind" in entry:
+        return 3
+    if "temp" in entry:
+        return 2
+    if "precipitation1h" in entry:
+        return 1
+    return 0
+
+
+def _pick_amedas_station(
+    candidates: list[tuple[str, dict[str, Any], float]],
+    observations: dict[str, Any],
+) -> tuple[str, dict[str, Any], float]:
+    """近傍候補から「風速を観測している観測所」を優先して選ぶ。
+
+    アメダスには雨量計のみの観測所があり、その場合は風速・気温が取れない。
+    ドローンの判断に必要な風速を優先し、同条件なら近い観測所を使う
+    （`candidates` は近い順なので `max` は最初の該当を返す）。
+    """
+
+    if not candidates:
+        raise WeatherFetchError(
+            "weather_invalid_response",
+            "気象庁の観測所を特定できませんでした。",
+            transient=False,
+        )
+
+    best = max(
+        candidates,
+        key=lambda item: _amedas_station_score(observations.get(item[0])),
+    )
+    if _amedas_station_score(observations.get(best[0])) <= 0:
+        return candidates[0]
+    return best
+
+
+def _amedas_timestamp(deadline: float) -> str:
+    """最新のアメダス観測時刻（JST・`YYYYMMDDHHMMSS`）を返す。
+
+    アメダスのファイル名は秒まで含む 14 桁（例: `20261115103000`）で、
+    12 桁では 404 になる。
+    """
+
+    response = _weather_get(
+        JMA_AMEDAS_LATEST_URL,
+        _weather_timeout(deadline, WEATHER_JMA_TIMEOUT),
+        "気象庁の観測時刻",
+    )
+    # 例: `2026-11-15T10:30:00+09:00` — 数字だけを取り出して時刻へ使う。
+    digits = re.sub(r"[^0-9]", "", str(getattr(response, "text", "") or ""))[:14]
+    if len(digits) != 14:
+        raise WeatherFetchError(
+            "weather_invalid_response",
+            "気象庁の観測時刻を読み取れませんでした。",
+            transient=False,
+        )
+    return digits
+
+
+def _shift_amedas_timestamp(timestamp: str, minutes: int) -> str:
+    """`YYYYMMDDHHMMSS` を分単位でずらす。"""
+
+    moment = datetime.strptime(timestamp, "%Y%m%d%H%M%S").replace(tzinfo=JST)
+    return (moment + timedelta(minutes=minutes)).strftime("%Y%m%d%H%M%S")
+
+
+def _amedas_observed_at(timestamp: str) -> str:
+    """`YYYYMMDDHHMMSS` を ISO 8601（JST）へ変換する。"""
+
+    moment = datetime.strptime(timestamp, "%Y%m%d%H%M%S").replace(tzinfo=JST)
+    return moment.isoformat(timespec="seconds")
+
+
+def _fetch_amedas_map(deadline: float) -> tuple[dict[str, Any], str]:
+    """最新時刻の全観測所の実測値を返す。
+
+    `latest_time.txt` の時刻に対応するファイルが未生成（404）のことがあるため、
+    10 分前まで遡って探す。
+    """
+
+    timestamp = _amedas_timestamp(deadline)
+    for attempt in range(JMA_AMEDAS_MAX_SLOT_FALLBACK):
+        url = JMA_AMEDAS_MAP_URL.format(ts=timestamp)
+        try:
+            response = _weather_get(
+                url,
+                _weather_timeout(deadline, WEATHER_JMA_TIMEOUT),
+                "気象庁のアメダス",
+            )
+        except WeatherFetchError as exc:
+            if (
+                exc.code == "weather_not_found"
+                and attempt + 1 < JMA_AMEDAS_MAX_SLOT_FALLBACK
+            ):
+                logger.info("weather jma: %s not found, trying previous slot", timestamp)
+                timestamp = _shift_amedas_timestamp(timestamp, -10)
+                continue
+            raise
+
+        observations = _weather_json(response, "気象庁のアメダス")
+        if not isinstance(observations, dict) or not observations:
+            raise WeatherFetchError(
+                "weather_invalid_response",
+                "気象庁のアメダスを解釈できませんでした。",
+                transient=False,
+            )
+        return observations, timestamp
+
+    raise WeatherFetchError(
+        "weather_not_found",
+        "気象庁のアメダスにデータがありません。",
+        transient=False,
+    )
+
+
+def _fetch_jma_amedas(lat: float, lon: float, deadline: float) -> dict[str, Any]:
+    """気象庁アメダスの最寄り観測所から現在の気象を返す。"""
+
+    table = _amedas_table(deadline)
+    observations, timestamp = _fetch_amedas_map(deadline)
+
+    candidates = _nearest_amedas_stations(lat, lon, table, limit=8)
+    station_id, station, distance_m = _pick_amedas_station(candidates, observations)
+    entry = observations.get(station_id) or {}
+
+    temperature = _amedas_value(entry, "temp")
+    precipitation = _amedas_value(entry, "precipitation1h")
+    text, code = _amedas_weather_text(
+        precipitation,
+        _amedas_value(entry, "snow"),
+        _amedas_value(entry, "sun1h"),
+        temperature,
+    )
+    distance_km = round(distance_m / 1000.0, 1)
+
+    notes = ["天候はアメダスの降水量・日照時間からの推定です。"]
+    nearest_id, nearest_station, nearest_distance_m = candidates[0]
+    if nearest_id != station_id:
+        notes.append(
+            f"最寄りの{nearest_station['name']}（約{nearest_distance_m / 1000:.1f}km）は"
+            f"雨量計のみのため、風速を観測している{station['name']}を使用しています。"
+        )
+    if distance_km >= 10.0:
+        notes.append(
+            f"最寄りの観測所（{station['name']}）まで約{distance_km:.1f}kmあります。"
+            "風速・気温は観測所の値のため、現場では参考値として扱ってください。"
+        )
+    notes.append("突風はアメダスでは観測していません（Open-Meteo 取得時のみ表示）。")
+
+    return {
+        "source": "jma-amedas",
+        "source_label": (
+            f"気象庁 アメダス（{station['name']}観測所・約{distance_km:.1f}km）"
+        ),
+        "weather": {
+            "text": text,
+            "code": code,
+            "temperature": temperature,
+            "humidity": _amedas_value(entry, "humidity"),
+            "precipitation": precipitation,
+            "wind_speed": _amedas_value(entry, "wind"),
+            "wind_gust": None,
+            "wind_direction": _amedas_wind_label(
+                _amedas_value(entry, "windDirection")
+            ),
+            "observed_at": _amedas_observed_at(timestamp),
+        },
+        "station": {
+            "id": station_id,
+            "name": station["name"],
+            "distance_km": distance_km,
+        },
+        "notes": notes,
+    }
+
+
+def _fetch_open_meteo(lat: float, lon: float, deadline: float) -> dict[str, Any]:
+    """Open-Meteo の現在値から気象を返す（気象庁の代替）。"""
+
+    params = {
+        "latitude": f"{lat:.5f}",
+        "longitude": f"{lon:.5f}",
+        "current": (
+            "temperature_2m,relative_humidity_2m,precipitation,weather_code,"
+            "wind_speed_10m,wind_gusts_10m,wind_direction_10m"
+        ),
+        "wind_speed_unit": "ms",
+        "timezone": "Asia/Tokyo",
+    }
+    response = _weather_get(
+        OPEN_METEO_URL,
+        _weather_timeout(deadline, WEATHER_OPEN_METEO_TIMEOUT),
+        "Open-Meteo",
+        params=params,
+    )
+    payload = _weather_json(response, "Open-Meteo")
+    current = payload.get("current") if isinstance(payload, dict) else None
+    if not isinstance(current, dict):
+        raise WeatherFetchError(
+            "weather_invalid_response",
+            "Open-Meteo の応答を読み取れませんでした。",
+            transient=False,
+        )
+
+    code_value = _round_optional(current.get("weather_code"), 0)
+    code = int(code_value) if code_value is not None else None
+    observed_at = str(current.get("time") or "").strip()
+
+    return {
+        "source": "open-meteo",
+        "source_label": "Open-Meteo",
+        "weather": {
+            "text": _WMO_WEATHER_TEXT.get(code, "不明") if code is not None else "不明",
+            "code": code,
+            "temperature": _round_optional(current.get("temperature_2m")),
+            "humidity": _round_optional(current.get("relative_humidity_2m")),
+            "precipitation": _round_optional(current.get("precipitation")),
+            "wind_speed": _round_optional(current.get("wind_speed_10m")),
+            "wind_gust": _round_optional(current.get("wind_gusts_10m")),
+            "wind_direction": _bearing_label(current.get("wind_direction_10m")),
+            "observed_at": observed_at or None,
+        },
+        "station": None,
+        "notes": ["Open-Meteo の現在値（予報モデル）を使用しています。"],
+    }
+
+
+def _is_transient_weather_error(exc: BaseException) -> bool:
+    """再試行する価値のある失敗か。"""
+
+    return isinstance(exc, WeatherFetchError) and exc.transient
+
+
+def _with_weather_retry(
+    fetcher: Callable[[float], dict[str, Any]],
+    deadline: float,
+) -> dict[str, Any]:
+    """一時的な失敗だけを指数バックオフで再試行する。
+
+    待機＋再試行が deadline に収まらない場合は、待たずに諦めて次の取得元へ
+    回す（現場で固まらせないことを優先する）。
+    """
+
+    def attempt() -> dict[str, Any]:
+        if deadline - time.monotonic() <= WEATHER_RETRY_MIN_REMAINING_SECONDS:
+            raise WeatherFetchError(
+                "weather_deadline_exceeded",
+                "気象データの取得が時間切れになりました。",
+                transient=False,
+                status_code=504,
+            )
+        return fetcher(deadline)
+
+    retrying = Retrying(
+        reraise=True,
+        stop=stop_after_attempt(max(1, WEATHER_RETRY_ATTEMPTS)),
+        wait=wait_exponential_jitter(
+            multiplier=WEATHER_RETRY_BASE_SECONDS,
+            max=WEATHER_RETRY_MAX_SECONDS,
+        ),
+        retry=retry_if_exception(_is_transient_weather_error),
+    )
+    return retrying(attempt)
+
+
+def _weather_cache_key(lat: float, lon: float) -> tuple[float, float]:
+    """キャッシュキー。座標を小数第3位へ丸める（日本付近で約 100m）。"""
+
+    return (round(lat, WEATHER_CACHE_PRECISION), round(lon, WEATHER_CACHE_PRECISION))
+
+
+def _weather_cache_get(key: tuple[float, float]) -> dict[str, Any] | None:
+    """キャッシュを取り出す（保護するのは辞書操作のみ）。"""
+
+    with _WEATHER_CACHE_LOCK:
+        entry = _WEATHER_CACHE.get(key)
+        return dict(entry) if entry else None
+
+
+def _weather_cache_put(key: tuple[float, float], payload: dict[str, Any]) -> None:
+    """キャッシュへ保存する。上限を超えたら最も古い項目を捨てる。"""
+
+    with _WEATHER_CACHE_LOCK:
+        if len(_WEATHER_CACHE) >= WEATHER_CACHE_MAX_ENTRIES and key not in _WEATHER_CACHE:
+            oldest = min(_WEATHER_CACHE, key=lambda item: _WEATHER_CACHE[item]["_ts"])
+            _WEATHER_CACHE.pop(oldest, None)
+        _WEATHER_CACHE[key] = {"_ts": time.monotonic(), **payload}
+
+
+def clear_weather_cache() -> None:
+    """気象キャッシュと観測所表を空にする（テスト・再起動用）。"""
+
+    global _AMEDAS_TABLE, _AMEDAS_TABLE_FETCHED_AT
+
+    with _WEATHER_CACHE_LOCK:
+        _WEATHER_CACHE.clear()
+    with _AMEDAS_TABLE_LOCK:
+        _AMEDAS_TABLE = {}
+        _AMEDAS_TABLE_FETCHED_AT = 0.0
+
+
+def _weather_payload_copy(entry: dict[str, Any]) -> dict[str, Any]:
+    """キャッシュ項目から `_ts` を除いた応答用の辞書を作る。"""
+
+    payload = {key: value for key, value in entry.items() if key != "_ts"}
+    payload["weather"] = dict(payload.get("weather") or {})
+    if isinstance(payload.get("station"), dict):
+        payload["station"] = dict(payload["station"])
+    payload["notes"] = list(payload.get("notes") or [])
+    payload["attempts"] = list(payload.get("attempts") or [])
+    return payload
+
+
+class WeatherObservation(BaseModel):
+    """観測所（または予報モデル）から得た現在の気象。"""
+
+    text: str = Field(..., description="天候（日本語）")
+    code: int | None = Field(None, description="WMO 相当の天候コード")
+    temperature: float | None = Field(None, description="気温（℃）")
+    humidity: float | None = Field(None, description="相対湿度（%）")
+    precipitation: float | None = Field(None, description="降水量（mm・1時間）")
+    wind_speed: float | None = Field(None, description="風速（m/s）")
+    wind_gust: float | None = Field(None, description="突風（m/s・気象庁では未観測）")
+    wind_direction: str | None = Field(None, description="風向（16方位）")
+    observed_at: str | None = Field(None, description="観測時刻（ISO 8601）")
+
+
+class WeatherStation(BaseModel):
+    """気象庁アメダスの観測所（Open-Meteo 取得時は null）。"""
+
+    id: str | None = Field(None, description="観測所番号")
+    name: str | None = Field(None, description="観測所名")
+    distance_km: float | None = Field(None, description="現場からの距離（km）")
+
+
+class WeatherResult(BaseModel):
+    """`GET /api/weather` のレスポンス。"""
+
+    ok: bool = True
+    lat: float
+    lng: float
+    source: str = Field(..., description="jma-amedas / open-meteo")
+    source_label: str = Field(..., description="表示用の出典")
+    weather: WeatherObservation
+    station: WeatherStation | None = None
+    notes: list[str] = Field(default_factory=list, description="注意書き")
+    attempts: list[str] = Field(default_factory=list, description="取得の試行履歴")
+    cached: bool = Field(False, description="キャッシュから返したか")
+    stale: bool = Field(False, description="古いキャッシュによる参考値か")
+    elapsed_ms: int = Field(0, ge=0, description="BFF の処理時間（ms）")
+    fetched_at: str = Field(..., description="BFF が応答を作成した時刻（JST）")
+
+
+def _collect_weather(lat: float, lon: float) -> dict[str, Any]:
+    """気象庁アメダス → Open-Meteo の順に取得し、最初に成功した結果を返す。"""
+
+    deadline = time.monotonic() + WEATHER_DEADLINE_SECONDS
+    attempts: list[str] = []
+    last_error: WeatherFetchError | None = None
+    providers: tuple[
+        tuple[str, Callable[[float, float, float], dict[str, Any]]], ...
+    ] = (
+        ("jma-amedas", _fetch_jma_amedas),
+        ("open-meteo", _fetch_open_meteo),
+    )
+
+    for name, fetcher in providers:
+        if deadline - time.monotonic() <= WEATHER_RETRY_MIN_REMAINING_SECONDS:
+            attempts.append(f"{name}:deadline")
+            logger.warning("weather %s: skipped (deadline exceeded)", name)
+            continue
+
+        started = time.monotonic()
+        try:
+            payload = _with_weather_retry(
+                lambda moment, call=fetcher: call(lat, lon, moment),
+                deadline,
+            )
+        except WeatherFetchError as exc:
+            last_error = exc
+            attempts.append(f"{name}:{exc.code}")
+            logger.warning(
+                "weather %s failed: code=%s transient=%s elapsed=%.2fs",
+                name,
+                exc.code,
+                exc.transient,
+                time.monotonic() - started,
+            )
+            continue
+
+        attempts.append(f"{name}:ok")
+        payload["attempts"] = attempts
+        return payload
+
+    if last_error is None:
+        raise WeatherFetchError(
+            "weather_deadline_exceeded",
+            "気象データの取得が時間切れになりました。",
+            transient=False,
+            status_code=504,
+        )
+    # 取得元が複数あるため、最後の失敗（多くはタイムアウト）をそのまま伝える。
+    raise last_error
+
+
+def _request_weather(lat: float, lon: float) -> dict[str, Any]:
+    """キャッシュ・参考値への縮退を含めた気象取得の入口。"""
+
+    key = _weather_cache_key(lat, lon)
+    cached = _weather_cache_get(key)
+    cached_age = time.monotonic() - float((cached or {}).get("_ts") or 0.0)
+
+    if cached and cached_age <= WEATHER_CACHE_TTL_SECONDS:
+        payload = _weather_payload_copy(cached)
+        payload.update(
+            {"lat": lat, "lng": lon, "cached": True, "stale": False, "elapsed_ms": 0}
+        )
+        return payload
+
+    started = time.monotonic()
+    try:
+        payload = _collect_weather(lat, lon)
+    except WeatherFetchError as exc:
+        # 全取得元が失敗しても、直近のキャッシュがあれば「参考値」として返す。
+        if cached and cached_age <= WEATHER_STALE_MAX_SECONDS:
+            payload = _weather_payload_copy(cached)
+            payload["notes"] = payload["notes"] + [
+                "気象の取得元が応答しないため、直近に取得した値（参考値）を表示しています。"
+            ]
+            payload.update(
+                {
+                    "lat": lat,
+                    "lng": lon,
+                    "cached": True,
+                    "stale": True,
+                    "elapsed_ms": int((time.monotonic() - started) * 1000),
+                }
+            )
+            logger.warning(
+                "weather stale fallback: lat=%.6f lng=%.6f age=%.0fs code=%s",
+                lat,
+                lon,
+                cached_age,
+                exc.code,
+            )
+            return payload
+        raise
+
+    payload.update(
+        {
+            "lat": lat,
+            "lng": lon,
+            "cached": False,
+            "stale": False,
+            "elapsed_ms": int((time.monotonic() - started) * 1000),
+        }
+    )
+    _weather_cache_put(key, payload)
+    return payload
+
+
+@app.get(
+    "/api/weather",
+    response_model=WeatherResult,
+    summary="座標の現在の気象（風・天候）を取得する",
+    responses={
+        422: {"description": "緯度・経度の検証エラー"},
+        502: {"description": "気象データの応答が不正・取得不可"},
+        503: {"description": "気象データが混雑、または取得できない"},
+        504: {"description": "気象データの取得がタイムアウト"},
+    },
+)
+def get_weather(
+    lat: float = Query(..., ge=-90.0, le=90.0, description="緯度"),
+    lng: float = Query(..., ge=-180.0, le=180.0, description="経度"),
+) -> WeatherResult:
+    """座標の現在の気象を返す。
+
+    主系は気象庁アメダス（最寄り観測所の実測値）。取得できない場合は
+    Open-Meteo へ切り替え、それも失敗したときは 30 分以内のキャッシュを
+    `stale=true` の参考値として返す。すべて失敗したときだけ 5xx を返す。
+    """
+
+    try:
+        payload = _request_weather(lat, lng)
+    except WeatherFetchError as exc:
+        logger.warning(
+            "weather failed: lat=%.6f lng=%.6f code=%s detail=%s",
+            lat,
+            lng,
+            exc.code,
+            exc.message,
+        )
+        raise _weather_error(exc.status_code, exc.code, exc.message) from exc
+
+    observation = payload.get("weather") or {}
+    station = payload.get("station") or {}
+    logger.info(
+        "weather ok: lat=%.6f lng=%.6f source=%s station=%s distance_km=%s "
+        "wind=%s temp=%s cached=%s stale=%s elapsed_ms=%d attempts=%s",
+        lat,
+        lng,
+        payload.get("source"),
+        station.get("id") or "-",
+        station.get("distance_km") if station else "-",
+        observation.get("wind_speed"),
+        observation.get("temperature"),
+        payload.get("cached"),
+        payload.get("stale"),
+        payload.get("elapsed_ms", 0),
+        ",".join(payload.get("attempts") or []) or "-",
+    )
+
+    return WeatherResult(
+        **payload,
+        fetched_at=datetime.now(JST).isoformat(timespec="seconds"),
+    )
+
+
 @app.post("/api/parse-log")
 async def parse_log(
     file: UploadFile = File(..., description="DJI の飛行ログ（.txt）"),
@@ -1959,7 +2900,7 @@ class DiagnoseFlightPlan(BaseModel):
 
 
 class DiagnoseWeather(BaseModel):
-    """Open-Meteo から取得済みの気象情報。"""
+    """気象情報（BFF が気象庁アメダスまたは Open-Meteo から取得した値）。"""
 
     text: str = Field("", max_length=40, description="天候（晴れ / 曇り など）")
     temperature: float | None = Field(None, ge=-50.0, le=60.0, description="気温（℃）")
@@ -1967,7 +2908,18 @@ class DiagnoseWeather(BaseModel):
     precipitation: float | None = Field(None, ge=0.0, description="降水量（mm）")
     wind_speed: float | None = Field(None, ge=0.0, description="風速（m/s）")
     wind_gust: float | None = Field(None, ge=0.0, description="突風（m/s）")
-    safety_status: str = Field("", max_length=16, description="GOOD / CAUTION / DANGER")
+    wind_direction: str = Field("", max_length=8, description="風向（16方位）")
+    observed_at: str = Field("", max_length=32, description="観測時刻（JST）")
+    source: str = Field(
+        "", max_length=120, description="出典（気象庁 アメダス（東京観測所）など）"
+    )
+    unavailable: bool = Field(False, description="気象データを取得できなかったか")
+    notes: list[str] = Field(
+        default_factory=list,
+        max_length=5,
+        description="出典・観測所の距離などの補足",
+    )
+    safety_status: str = Field("", max_length=16, description="GOOD / CAUTION / DANGER / UNKNOWN")
     safety_label: str = Field("", max_length=160, description="判定理由")
 
 
@@ -2084,6 +3036,8 @@ def _build_diagnosis_prompt(req: DiagnoseRequest, has_image: bool) -> str:
         "- データに無い事実を断定しない。",
         "- 添付写真がある場合のみ、写真から見える対象（電線・人物・車両・建物など）に触れる。",
         "- 風速・突風・降水・DID・150m規制・目視外・夜間など、該当する論点に触れる。",
+        "- 気象データが「取得できなかった」場合は、風・降水を安全と断定せず現地確認を促す。",
+        "- 気象の出典・観測所までの距離が遠い場合は、その値を参考値として扱う。",
         "- 空域の特定飛行判定とカテゴリーは、データ内の「空域の特定飛行判定」「空域から決まる下限カテゴリー」を優先し、独自に引き下げない。",
         "- 具体的な行動（離陸位置の変更、補助者配置、飛行高度、待機基準など）を含める。",
         "- 最後に「最終判断は操縦者が行う」旨を短く添える。",
@@ -2132,10 +3086,20 @@ def _build_diagnosis_prompt(req: DiagnoseRequest, has_image: bool) -> str:
             _ai_line("湿度", weather.humidity, "%"),
             _ai_line("降水量", weather.precipitation, "mm"),
             _ai_line("風速", weather.wind_speed, "m/s"),
+            _ai_line("風向", weather.wind_direction),
             _ai_line("突風", weather.wind_gust, "m/s"),
             _ai_line(
                 "気象判定",
                 " ".join(x for x in (weather.safety_status, weather.safety_label) if x),
+            ),
+            _ai_line("気象の観測時刻", weather.observed_at),
+            _ai_line("気象の出典", weather.source),
+            _ai_line("気象の補足", " / ".join(weather.notes)),
+            _ai_line(
+                "気象データ",
+                "取得できなかった（風・降水は現地で確認が必要）"
+                if weather.unavailable
+                else None,
             ),
         ]
 

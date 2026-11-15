@@ -18,6 +18,11 @@ PWA のリスク判定・特定飛行区分用 JSON を返します。
 から取得し、「日本、〒…」を除いた住所文字列を返します。キーは BFF の `.env` だけで
 管理します。
 
+`GET /api/weather` では、指定座標の現在の気象を**気象庁アメダス**（国内の実測値・
+10 分更新）から取得し、取得できない場合だけ Open-Meteo へフォールバックします。
+取得元・観測所・距離・試行履歴・キャッシュ状態まで返すため、PWA 側で
+「いつの・どこで観測された値か」を画面に出せます。
+
 `POST /api/diagnose` では、飛行計画・気象・標高・DID・周辺インフラ・機体情報と
 任意の現場写真から、Gemini API で飛行前の安全診断文を生成します。API キーは
 BFF の環境変数（`.env`）だけで管理し、ブラウザへは渡しません。
@@ -380,6 +385,87 @@ OSM API の bbox は半径から自動計算し、BFF 側で点と線分の距�
 | `INFRA_CACHE_MAX_ENTRIES` | `256` | キャッシュの最大件数（超過時は古い順に破棄） |
 | `INFRA_CACHE_PRECISION` | `3` | キャッシュキーの丸め桁（小数第3位 ≒ 100m） |
 
+### `GET /api/weather`
+
+指定座標の**現在の気象**を返します。主系は気象庁アメダス、代替が Open-Meteo です。
+
+- クエリパラメータ
+  - `lat`（必須）: 緯度 `-90.0`〜`90.0`
+  - `lng`（必須）: 経度 `-180.0`〜`180.0`
+- 成功時: `200` + 下記 JSON
+- 入力不備: `422`（FastAPI 標準）
+- 取得元の優先順
+  1. **気象庁アメダス**（`latest_time.txt` → `map/{14桁タイムスタンプ}.json`）
+     - 現場から**風を観測している観測所**を優先して 1 局選び、緯度経度は
+       アメダス観測所表（`amedastable.json`、1 日キャッシュ）から引きます。
+     - 最新時刻のファイルが未生成なことがあるため、`10分前 → 20分前 → 30分前`
+       まで遡ります（`JMA_AMEDAS_MAX_SLOT_FALLBACK`）。
+     - アメダスは**突風を観測していません**（`wind_gust` は `null`）。突風が必要な
+       場合は Open-Meteo の値を併用してください。
+     - 雨量計のみの観測所（風・気温なし）しか近くに無い場合は、その観測所を使い
+       `notes` に「風を観測していない観測所」である旨を追加します。
+  2. **Open-Meteo**（`current=temperature_2m,...`）
+     - WMO 天候コードと突風が取れます。`station` は `null`。
+- フォールバックと縮退
+  - 一時的な失敗（タイムアウト・接続断・5xx）は 0.25 秒 → 0.5 秒（上限 0.75 秒）で
+    再試行し、恒久的な失敗（404・不正な応答）は再試行しません。
+  - 全取得元が失敗しても `WEATHER_STALE_MAX_SECONDS`（既定 30 分）以内の
+    キャッシュがあれば `200` + `stale=true` で「参考値」として返します。
+  - それも無ければ `502` / `503` / `504` + エラーコード
+    （`weather_unavailable` / `weather_timeout` / `weather_invalid_response` /
+    `weather_deadline_exceeded` など）。
+- メモリキャッシュ: 座標を小数第3位（約 100m）へ丸めたキーで
+  `WEATHER_CACHE_TTL_SECONDS`（既定 120 秒）保持し、`cached=true` で返します。
+- 応答例（東京都千代田区）
+
+```json
+{
+  "ok": true,
+  "lat": 35.7,
+  "lng": 139.7,
+  "source": "jma-amedas",
+  "source_label": "気象庁 アメダス（東京・約 2.1km）",
+  "weather": {
+    "text": "曇り",
+    "code": 3,
+    "temperature": 14.2,
+    "humidity": 62.0,
+    "precipitation": 0.0,
+    "wind_speed": 3.4,
+    "wind_gust": null,
+    "wind_direction": "北北西",
+    "observed_at": "2026-11-15T10:30:00+09:00"
+  },
+  "station": { "id": "44166", "name": "東京", "distance_km": 2.1 },
+  "notes": ["気象庁アメダスの観測所（東京）の実測値です。"],
+  "attempts": ["jma-amedas:ok"],
+  "cached": false,
+  "stale": false,
+  "elapsed_ms": 210,
+  "fetched_at": "2026-11-15T10:34:12+09:00"
+}
+```
+
+```bash
+curl -sS 'http://127.0.0.1:8000/api/weather?lat=35.7&lng=139.7'
+```
+
+| 環境変数 | 既定値 | 用途 |
+|---|---|---|
+| `JMA_AMEDAS_LATEST_URL` | `https://www.jma.go.jp/bosai/amedas/data/latest_time.txt` | 最新観測時刻の取得先 |
+| `JMA_AMEDAS_MAP_URL` | `https://www.jma.go.jp/bosai/amedas/data/map/{ts}.json` | 全観測所の観測値（`{ts}` は 14 桁） |
+| `JMA_AMEDAS_TABLE_URL` | `https://www.jma.go.jp/bosai/amedas/const/amedastable.json` | 観測所表（緯度経度・観測要素） |
+| `OPEN_METEO_URL` | `https://api.open-meteo.com/v1/forecast` | 代替の取得先 |
+| `WEATHER_DEADLINE_SECONDS` | `8.0` | 1 リクエストで気象取得に使う総時間の上限 |
+| `WEATHER_RETRY_ATTEMPTS` | `2` | 一時的な失敗の最大試行回数 |
+| `WEATHER_RETRY_BASE_SECONDS` | `0.25` | 再試行の初期待機秒（倍々、上限 `WEATHER_RETRY_MAX_SECONDS`） |
+| `WEATHER_RETRY_MAX_SECONDS` | `0.75` | 再試行待機の上限秒 |
+| `WEATHER_CACHE_TTL_SECONDS` | `120` | 気象結果のキャッシュ保持秒 |
+| `WEATHER_CACHE_MAX_ENTRIES` | `256` | キャッシュの最大件数 |
+| `WEATHER_CACHE_PRECISION` | `3` | キャッシュキーの丸め桁（小数第3位 ≒ 100m） |
+| `WEATHER_STALE_MAX_SECONDS` | `1800` | 全滅時に「参考値」として返すキャッシュの上限秒 |
+| `JMA_AMEDAS_TABLE_TTL_SECONDS` | `86400` | 観測所表のキャッシュ保持秒 |
+
 ### `POST /api/parse-log`
 
 - Content-Type: `multipart/form-data`
@@ -638,6 +724,7 @@ OSM 取得と DID 判定は並列に走り、全体は 5 秒で打ち切られ�
 
 ```bash
 .venv/bin/python -m unittest tests.test_legal tests.test_check_infrastructure -v
+.venv/bin/python tests/test_weather.py -v
 DRONE_LOG_LIVE=1 .venv/bin/python -m unittest tests.test_infrastructure_live -v
 ```
 
@@ -652,6 +739,11 @@ DRONE_LOG_LIVE=1 .venv/bin/python -m unittest tests.test_infrastructure_live -v
   （ヒット／TTL 失効／キーの丸め）を検証
 - `tests/test_infrastructure_live.py`: 実 API（GSI / OSM）で品川駅・羽田・大雪山を検証。
   `DRONE_LOG_LIVE=1` を指定したときだけ実行。
+- `tests/test_weather.py`: 気象 API のオフラインテスト（`requests.get` をモック）。
+  14 桁タイムスタンプの組み立て・観測所の選択（風観測所の優先／雨量計のみへの縮退）・
+  品質フラグ付き値の除外・天候文の推定・Latest から前スロットへの遡り・全滅時の
+  エラー、キャッシュ（ヒット／TTL 失効／参考値への縮退）、API のフォールバック
+  （アメダス → Open-Meteo）・全滅時 503・座標バリデーションを検証
 
 Gemini を呼ばないオフラインのユニットテストは `tests/test_diagnose.py` です
 （`_request_gemini_text` をモックし、正常系・画像検証・エラー対応を確認）。
