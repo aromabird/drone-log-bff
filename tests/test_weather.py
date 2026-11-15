@@ -6,6 +6,7 @@
 - 雨量計のみの観測所しか近くに無いときの観測所選択
 - 最新時刻のファイルが 404 のときの 10 分前スロットへの後退
 - 気象庁 → Open-Meteo のフォールバック、キャッシュ、参考値（stale）
+- 取得元ごとの時間予算（主系が遅いときも代替へ必ず回す）
 - 入力検証とエラーの構造化
 
 を検証する。実行: `.venv/bin/python tests/test_weather.py -v`
@@ -13,9 +14,13 @@
 
 from __future__ import annotations
 
+import json
+import socketserver
 import sys
+import threading
 import time
 import unittest
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -427,6 +432,275 @@ class WeatherApiTests(unittest.TestCase):
 
     def test_requires_coordinates(self) -> None:
         self.assertEqual(client.get("/api/weather").status_code, 422)
+
+
+OPEN_METEO_BODY: dict[str, Any] = {
+    "current": {
+        "time": "2026-11-15T11:00",
+        "temperature_2m": 11.0,
+        "relative_humidity_2m": 70,
+        "precipitation": 0.0,
+        "weather_code": 2,
+        "wind_speed_10m": 3.0,
+        "wind_gusts_10m": 6.0,
+        "wind_direction_10m": 315,
+    }
+}
+
+
+def jma_payload() -> dict[str, Any]:
+    """気象庁側が成功したときの取得結果（再試行のテスト用）。"""
+
+    return {
+        "source": "jma-amedas",
+        "source_label": "気象庁 アメダス（風観測B観測所・約0.5km）",
+        "weather": {
+            "text": "曇り",
+            "code": 3,
+            "temperature": 12.3,
+            "humidity": 58.0,
+            "precipitation": 0.0,
+            "wind_speed": 4.5,
+            "wind_gust": None,
+            "wind_direction": "北",
+            "observed_at": "2026-11-15T10:30:00+09:00",
+        },
+        "station": {"id": "1002", "name": "風観測B", "distance_km": 0.5},
+        "notes": ["テスト用"],
+    }
+
+
+class _StubHTTPServer(ThreadingHTTPServer):
+    """`server_bind` の逆引き（getfqdn）で待たされないサーバー。
+
+    標準の `HTTPServer.server_bind` は `socket.getfqdn` を呼ぶため、DNS が
+    遅い環境ではテストが十数秒待たされる。127.0.0.1 固定なので逆引きしない。
+    """
+
+    def server_bind(self) -> None:
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = str(host)
+        self.server_port = int(port)
+
+
+class WeatherStubServer:
+    """気象 API の代用になるローカル HTTP サーバー。
+
+    実ソケットを使うことで、`requests` のタイムアウト挙動まで含めて
+    「遅い気象庁 → Open-Meteo へフォールバック」を再現する。
+    `/latest_time.txt` だけ任意の秒数だけ遅らせられる。
+    """
+
+    def __init__(self, *, latest_delay: float = 0.0) -> None:
+        self.latest_delay = latest_delay
+        self.hits: dict[str, int] = {}
+        self._server = _StubHTTPServer(("127.0.0.1", 0), self._handler())
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+
+    @property
+    def base_url(self) -> str:
+        host, port = self._server.server_address[:2]
+        return f"http://{host}:{port}"
+
+    def __enter__(self) -> "WeatherStubServer":
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+        self._thread.join(timeout=2.0)
+
+    def hit_count(self, prefix: str) -> int:
+        return sum(count for path, count in self.hits.items() if path.startswith(prefix))
+
+    def _handler(self) -> type[BaseHTTPRequestHandler]:
+        stub = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self) -> None:  # noqa: N802 - http.server の命名
+                stub.hits[self.path] = stub.hits.get(self.path, 0) + 1
+                if self.path.startswith("/latest_time"):
+                    time.sleep(stub.latest_delay)
+                    body = LATEST_TIME.encode()
+                elif self.path.startswith("/table.json"):
+                    body = json.dumps(AMEDAS_TABLE).encode()
+                elif self.path.startswith("/map/"):
+                    body = json.dumps(observations_for()).encode()
+                elif self.path.startswith("/open-meteo"):
+                    body = json.dumps(OPEN_METEO_BODY).encode()
+                else:
+                    self.send_error(404)
+                    return
+                try:
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(body)))
+                    self.end_headers()
+                    self.wfile.write(body)
+                except OSError:
+                    # クライアントがタイムアウトで切った後（想定内）。
+                    pass
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        return Handler
+
+
+class WeatherBudgetTests(unittest.TestCase):
+    """取得元ごとの時間予算と再試行ポリシーのテスト。"""
+
+    def test_primary_budget_keeps_time_for_fallback(self) -> None:
+        now = time.monotonic()
+        provider_deadline = main._weather_provider_deadline(now + 8.0, 8.0, False)
+
+        # 既定: 予算 4 秒。代替のために 3 秒以上を残す。
+        self.assertAlmostEqual(
+            provider_deadline - now, main.WEATHER_PROVIDER_BUDGET_SECONDS, delta=0.05
+        )
+        self.assertGreaterEqual(
+            (now + 8.0) - provider_deadline, main.WEATHER_FALLBACK_RESERVE_SECONDS - 0.05
+        )
+
+    def test_short_remaining_is_split_between_providers(self) -> None:
+        now = time.monotonic()
+        provider_deadline = main._weather_provider_deadline(now + 2.0, 2.0, False)
+
+        # 残り 2 秒なら半分（1 秒）を主系、残りを代替に割り当てる。
+        self.assertAlmostEqual(provider_deadline - now, 1.0, delta=0.05)
+
+    def test_last_provider_can_use_full_deadline(self) -> None:
+        target = time.monotonic() + 8.0
+
+        self.assertEqual(main._weather_provider_deadline(target, 8.0, True), target)
+
+    def test_timeout_is_retried_only_for_last_provider(self) -> None:
+        timeout = main.WeatherFetchError(
+            "weather_timeout", "応答がありません。", transient=True, status_code=504
+        )
+        busy = main.WeatherFetchError(
+            "weather_unavailable", "混雑しています。", transient=True, status_code=503
+        )
+
+        # 主系（retry_timeouts=False）はタイムアウトを再試行しない。
+        self.assertFalse(main._is_transient_weather_error(timeout, False))
+        # 最後の取得元は残り時間の中で再試行してよい。
+        self.assertTrue(main._is_transient_weather_error(timeout, True))
+        # 429・5xx はすぐ返る失敗なので主系でも再試行する。
+        self.assertTrue(main._is_transient_weather_error(busy, False))
+
+
+class WeatherTimeBudgetTests(unittest.TestCase):
+    """主系が遅い／落ちているときに代替で応答することを実ソケットで確かめる。"""
+
+    def setUp(self) -> None:
+        main.clear_weather_cache()
+        self.addCleanup(main.clear_weather_cache)
+
+    def test_slow_jma_falls_back_to_open_meteo_without_5xx(self) -> None:
+        # 気象庁の latest_time.txt だけ 1.5 秒遅らせ、応答タイムアウトを 0.3 秒にする。
+        with WeatherStubServer(latest_delay=1.5) as stub:
+            with patch.object(
+                main, "JMA_AMEDAS_LATEST_URL", f"{stub.base_url}/latest_time.txt"
+            ), patch.object(
+                main, "JMA_AMEDAS_TABLE_URL", f"{stub.base_url}/table.json"
+            ), patch.object(
+                main, "JMA_AMEDAS_MAP_URL", f"{stub.base_url}/map/{{ts}}.json"
+            ), patch.object(
+                main, "OPEN_METEO_URL", f"{stub.base_url}/open-meteo"
+            ), patch.object(
+                main, "WEATHER_JMA_TIMEOUT", (0.2, 0.3)
+            ), patch.object(
+                main, "WEATHER_OPEN_METEO_TIMEOUT", (0.2, 0.5)
+            ), patch.object(
+                main, "WEATHER_DEADLINE_SECONDS", 3.0
+            ), patch.object(
+                main, "WEATHER_PROVIDER_BUDGET_SECONDS", 1.0
+            ), patch.object(
+                main, "WEATHER_FALLBACK_RESERVE_SECONDS", 1.5
+            ):
+                started = time.monotonic()
+                response = client.get(
+                    "/api/weather", params={"lat": LAT, "lng": LON}
+                )
+                elapsed = time.monotonic() - started
+
+            self.assertEqual(response.status_code, 200, response.text)
+            data = response.json()
+            self.assertEqual(data["source"], "open-meteo")
+            self.assertEqual(data["weather"]["wind_gust"], 6.0)
+            self.assertEqual(
+                data["attempts"], ["jma-amedas:weather_timeout", "open-meteo:ok"]
+            )
+            self.assertFalse(data["stale"])
+            # 全体予算（3 秒）を超えずに返る。
+            self.assertLess(elapsed, 3.0)
+            # タイムアウトした主系は再試行しない（残り時間を代替へ回す）。
+            self.assertEqual(stub.hit_count("/latest_time.txt"), 1)
+            self.assertEqual(stub.hit_count("/open-meteo"), 1)
+
+    def test_unreachable_jma_falls_back(self) -> None:
+        # 接続できない URL（ポート 9 = discard）へ差し替える。
+        with patch.object(
+            main, "JMA_AMEDAS_TABLE_URL", "http://127.0.0.1:9/table.json"
+        ), patch.object(
+            main, "JMA_AMEDAS_LATEST_URL", "http://127.0.0.1:9/latest_time.txt"
+        ):
+            with patch(
+                "main._fetch_open_meteo", return_value=jma_payload()
+            ) as open_meteo:
+                response = client.get("/api/weather", params={"lat": LAT, "lng": LON})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(open_meteo.call_count, 1)
+
+    def test_primary_timeout_is_not_retried(self) -> None:
+        timeout = main.WeatherFetchError(
+            "weather_timeout", "気象庁の応答がありません。", transient=True, status_code=504
+        )
+        with patch("main._fetch_jma_amedas", side_effect=timeout) as jma:
+            with patch("main._fetch_open_meteo", return_value=jma_payload()):
+                response = client.get("/api/weather", params={"lat": LAT, "lng": LON})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(jma.call_count, 1)
+        self.assertEqual(
+            response.json()["attempts"], ["jma-amedas:weather_timeout", "open-meteo:ok"]
+        )
+
+    def test_transient_congestion_is_retried(self) -> None:
+        busy = main.WeatherFetchError(
+            "weather_unavailable", "気象庁が混雑しています。", transient=True, status_code=503
+        )
+        with patch("main._fetch_jma_amedas", side_effect=[busy, jma_payload()]) as jma:
+            with patch("main._fetch_open_meteo") as open_meteo:
+                response = client.get("/api/weather", params={"lat": LAT, "lng": LON})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(jma.call_count, 2)  # 1 回目 503 → 指数バックオフ後に成功
+        open_meteo.assert_not_called()
+        self.assertEqual(response.json()["attempts"], ["jma-amedas:ok"])
+
+    def test_all_providers_timeout_returns_structured_error(self) -> None:
+        timeout = main.WeatherFetchError(
+            "weather_timeout", "気象データの応答がありません。", transient=True, status_code=504
+        )
+        with patch.object(main, "WEATHER_DEADLINE_SECONDS", 2.0), patch.object(
+            main, "WEATHER_PROVIDER_BUDGET_SECONDS", 1.2
+        ), patch.object(main, "WEATHER_FALLBACK_RESERVE_SECONDS", 0.8):
+            with patch("main._fetch_jma_amedas", side_effect=timeout):
+                with patch("main._fetch_open_meteo", side_effect=timeout):
+                    started = time.monotonic()
+                    response = client.get(
+                        "/api/weather", params={"lat": LAT, "lng": LON}
+                    )
+                    elapsed = time.monotonic() - started
+
+        self.assertEqual(response.status_code, 504, response.text)
+        self.assertEqual(response.json()["detail"]["code"], "weather_timeout")
+        self.assertLess(elapsed, 2.0)
 
 
 if __name__ == "__main__":

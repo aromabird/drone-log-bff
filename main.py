@@ -142,12 +142,27 @@ OPEN_METEO_URL = os.getenv(
     "https://api.open-meteo.com/v1/forecast",
 ).strip()
 
-# 接続3秒・応答4秒。全体 deadline（既定8秒）と PWA 側の打ち切り（12秒）より
-# 短くして、BFF が先に構造化エラーを返せるようにする。
-WEATHER_JMA_TIMEOUT = (3.0, 4.0)
+# 1 回の HTTP 呼び出しのタイムアウト（接続・応答）。
+#
+# 主系（気象庁アメダス）は 2.5 秒で打ち切る。実測 0.1〜0.3 秒で返るため、
+# これを超えたら「回線が詰まっている」と判断して代替（Open-Meteo）へ切り替える。
+# 以前は 4 秒 + 再試行で全体予算を使い切り、代替へ回れずに 5xx になっていた
+# （実測: JMA が 4.2 秒ハング → 9.17 秒で失敗、`open-meteo:deadline`）。
+WEATHER_JMA_TIMEOUT = (1.5, 2.5)
+# 代替（Open-Meteo）は最後の砦なので、やや長めに待つ。
 WEATHER_OPEN_METEO_TIMEOUT = (3.0, 4.0)
 # 1リクエストで気象取得に使う総時間の上限。超えたら残りの取得元を試さない。
 WEATHER_DEADLINE_SECONDS = float(os.getenv("WEATHER_DEADLINE_SECONDS", "8.0"))
+# 1 取得元あたりの時間予算（再試行の待機を含む）。
+# 主系が固まっても代替の取り分を残すため、全体 deadline とは別に
+# 取得元ごとの締め切りを切る。
+WEATHER_PROVIDER_BUDGET_SECONDS = float(
+    os.getenv("WEATHER_PROVIDER_BUDGET_SECONDS", "4.0")
+)
+# 後続の取得元（代替）のために必ず残す時間。主系はこれを侵食できない。
+WEATHER_FALLBACK_RESERVE_SECONDS = float(
+    os.getenv("WEATHER_FALLBACK_RESERVE_SECONDS", "3.0")
+)
 # 一時的な失敗（タイムアウト・接続断・5xx）に対する指数バックオフ再試行。
 # 1回目の待機 0.25 秒 → 0.5 秒（上限 0.75 秒、ジッター付き）。恒久的原因
 # （404・不正な応答）は再試行しない。
@@ -1894,11 +1909,15 @@ def _weather_error(status_code: int, code: str, message: str) -> HTTPException:
 
 
 def _weather_timeout(deadline: float, base: tuple[float, float]) -> tuple[float, float]:
-    """残り時間に収まるよう接続・応答のタイムアウトを縮める。"""
+    """残り時間に収まるよう接続・応答のタイムアウトを縮める。
 
-    remaining = max(1.0, deadline - time.monotonic())
-    connect = min(base[0], max(0.8, remaining * 0.4))
-    read = min(base[1], max(1.0, remaining * 0.6))
+    取得元ごとの締め切り（provider deadline）を超えないことを優先するため、
+    下限は小さく取る（残りが僅かなら 0.4 秒で試して諦める）。
+    """
+
+    remaining = max(0.4, deadline - time.monotonic())
+    connect = min(base[0], max(0.4, remaining * 0.4))
+    read = min(base[1], max(0.4, remaining * 0.6))
     return (connect, read)
 
 
@@ -2437,24 +2456,42 @@ def _fetch_open_meteo(lat: float, lon: float, deadline: float) -> dict[str, Any]
     }
 
 
-def _is_transient_weather_error(exc: BaseException) -> bool:
-    """再試行する価値のある失敗か。"""
+def _is_transient_weather_error(
+    exc: BaseException, retry_timeouts: bool = True
+) -> bool:
+    """再試行する価値のある失敗か。
 
-    return isinstance(exc, WeatherFetchError) and exc.transient
+    タイムアウトは「相手が遅い」サインであり、同じ取得元で待ち直すより
+    残り時間を次の取得元へ回したほうが復旧が早い。そのため主系では
+    タイムアウトを再試行しない（`retry_timeouts=False`）。429・5xx・接続断の
+    ような「すぐ返ってくる失敗」だけを短いバックオフで再試行する。
+    """
+
+    if not isinstance(exc, WeatherFetchError) or not exc.transient:
+        return False
+    if exc.code == "weather_timeout" and not retry_timeouts:
+        return False
+    return True
 
 
 def _with_weather_retry(
     fetcher: Callable[[float], dict[str, Any]],
     deadline: float,
+    retry_timeouts: bool = True,
 ) -> dict[str, Any]:
     """一時的な失敗だけを指数バックオフで再試行する。
 
     待機＋再試行が deadline に収まらない場合は、待たずに諦めて次の取得元へ
     回す（現場で固まらせないことを優先する）。
+
+    `deadline` は取得元ごとの締め切り（provider deadline）を渡す。全体の
+    deadline を渡すと主系の再試行が代替の取り分を食い潰す。
     """
 
     def attempt() -> dict[str, Any]:
-        if deadline - time.monotonic() <= WEATHER_RETRY_MIN_REMAINING_SECONDS:
+        # 1 回目の試行は「残りが少しでもあれば」実行する。再試行の可否は
+        # 下の should_retry で判断する（1.0 秒を下回ると待ち直しに意味がない）。
+        if deadline - time.monotonic() <= 0.05:
             raise WeatherFetchError(
                 "weather_deadline_exceeded",
                 "気象データの取得が時間切れになりました。",
@@ -2463,6 +2500,12 @@ def _with_weather_retry(
             )
         return fetcher(deadline)
 
+    def should_retry(exc: BaseException) -> bool:
+        if not _is_transient_weather_error(exc, retry_timeouts):
+            return False
+        # 待機＋再試行に必要な時間が残っていなければ、次の取得元へ回す。
+        return deadline - time.monotonic() > WEATHER_RETRY_MIN_REMAINING_SECONDS
+
     retrying = Retrying(
         reraise=True,
         stop=stop_after_attempt(max(1, WEATHER_RETRY_ATTEMPTS)),
@@ -2470,7 +2513,7 @@ def _with_weather_retry(
             multiplier=WEATHER_RETRY_BASE_SECONDS,
             max=WEATHER_RETRY_MAX_SECONDS,
         ),
-        retry=retry_if_exception(_is_transient_weather_error),
+        retry=retry_if_exception(should_retry),
     )
     return retrying(attempt)
 
@@ -2563,8 +2606,30 @@ class WeatherResult(BaseModel):
     fetched_at: str = Field(..., description="BFF が応答を作成した時刻（JST）")
 
 
+def _weather_provider_deadline(
+    deadline: float, remaining: float, is_last: bool
+) -> float:
+    """取得元ごとの締め切りを決める。
+
+    先に試す取得元には `WEATHER_PROVIDER_BUDGET_SECONDS` の予算だけを与え、
+    後続（代替）の取り分 `WEATHER_FALLBACK_RESERVE_SECONDS` を必ず残す。
+    最後の取得元は残り時間をすべて使える。
+    """
+
+    now = time.monotonic()
+    if is_last:
+        return deadline
+    reserve = min(WEATHER_FALLBACK_RESERVE_SECONDS, max(0.0, remaining * 0.5))
+    budget = min(WEATHER_PROVIDER_BUDGET_SECONDS, max(0.0, remaining - reserve))
+    return min(deadline, now + budget)
+
+
 def _collect_weather(lat: float, lon: float) -> dict[str, Any]:
-    """気象庁アメダス → Open-Meteo の順に取得し、最初に成功した結果を返す。"""
+    """気象庁アメダス → Open-Meteo の順に取得し、最初に成功した結果を返す。
+
+    主系がハングしても代替の取り分を残すため、取得元ごとに締め切りを切る。
+    主系のタイムアウトは再試行せず、即座に代替へ回す（残り時間の温存）。
+    """
 
     deadline = time.monotonic() + WEATHER_DEADLINE_SECONDS
     attempts: list[str] = []
@@ -2576,26 +2641,31 @@ def _collect_weather(lat: float, lon: float) -> dict[str, Any]:
         ("open-meteo", _fetch_open_meteo),
     )
 
-    for name, fetcher in providers:
-        if deadline - time.monotonic() <= WEATHER_RETRY_MIN_REMAINING_SECONDS:
+    for index, (name, fetcher) in enumerate(providers):
+        remaining = deadline - time.monotonic()
+        if remaining <= WEATHER_RETRY_MIN_REMAINING_SECONDS:
             attempts.append(f"{name}:deadline")
             logger.warning("weather %s: skipped (deadline exceeded)", name)
             continue
 
+        is_last = index == len(providers) - 1
+        provider_deadline = _weather_provider_deadline(deadline, remaining, is_last)
         started = time.monotonic()
         try:
             payload = _with_weather_retry(
                 lambda moment, call=fetcher: call(lat, lon, moment),
-                deadline,
+                provider_deadline,
+                retry_timeouts=is_last,
             )
         except WeatherFetchError as exc:
             last_error = exc
             attempts.append(f"{name}:{exc.code}")
             logger.warning(
-                "weather %s failed: code=%s transient=%s elapsed=%.2fs",
+                "weather %s failed: code=%s transient=%s budget=%.2fs elapsed=%.2fs",
                 name,
                 exc.code,
                 exc.transient,
+                provider_deadline - started,
                 time.monotonic() - started,
             )
             continue

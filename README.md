@@ -20,8 +20,9 @@ PWA のリスク判定・特定飛行区分用 JSON を返します。
 
 `GET /api/weather` では、指定座標の現在の気象を**気象庁アメダス**（国内の実測値・
 10 分更新）から取得し、取得できない場合だけ Open-Meteo へフォールバックします。
-取得元・観測所・距離・試行履歴・キャッシュ状態まで返すため、PWA 側で
-「いつの・どこで観測された値か」を画面に出せます。
+**取得元ごとに時間予算を区切っている**ため、気象庁がハングしても代替の取り分が
+残り、5xx にならずに Open-Meteo の値が返ります。取得元・観測所・距離・試行履歴・
+キャッシュ状態まで返すため、PWA 側で「いつの・どこで観測された値か」を画面に出せます。
 
 `POST /api/diagnose` では、飛行計画・気象・標高・DID・周辺インフラ・機体情報と
 任意の現場写真から、Gemini API で飛行前の安全診断文を生成します。API キーは
@@ -406,14 +407,28 @@ OSM API の bbox は半径から自動計算し、BFF 側で点と線分の距�
        `notes` に「風を観測していない観測所」である旨を追加します。
   2. **Open-Meteo**（`current=temperature_2m,...`）
      - WMO 天候コードと突風が取れます。`station` は `null`。
-- フォールバックと縮退
-  - 一時的な失敗（タイムアウト・接続断・5xx）は 0.25 秒 → 0.5 秒（上限 0.75 秒）で
-    再試行し、恒久的な失敗（404・不正な応答）は再試行しません。
+- 時間予算（タイムアウトの厳格化）
+  - 1 回の HTTP 呼び出しは、主系（気象庁）**2.5 秒** / 代替（Open-Meteo）4 秒で
+    打ち切ります。実測 0.1〜0.3 秒で返るため、2.5 秒を超える＝経路が詰まっている
+    と判断します。
+  - 取得元ごとに締め切りを切ります。主系は `WEATHER_PROVIDER_BUDGET_SECONDS`
+    （既定 4 秒）までとし、後続の代替のために
+    `WEATHER_FALLBACK_RESERVE_SECONDS`（既定 3 秒）を必ず残します。主系が
+    ハングしても Open-Meteo は必ず試されます。
+  - 主系の**タイムアウトは再試行しません**（相手が遅いサインなので、残り時間を
+    代替へ回す）。429・5xx・接続断のような「すぐ返る失敗」だけを 0.25 秒 →
+    0.5 秒（上限 0.75 秒）で再試行します。恒久的な失敗（404・不正な応答）は
+    再試行しません。
+  - 全体は `WEATHER_DEADLINE_SECONDS`（既定 8 秒）で打ち切り、PWA 側の
+    打ち切り（12 秒）より先に構造化エラーを返します。
+- 縮退
   - 全取得元が失敗しても `WEATHER_STALE_MAX_SECONDS`（既定 30 分）以内の
     キャッシュがあれば `200` + `stale=true` で「参考値」として返します。
   - それも無ければ `502` / `503` / `504` + エラーコード
     （`weather_unavailable` / `weather_timeout` / `weather_invalid_response` /
     `weather_deadline_exceeded` など）。
+  - 主系が遅い場合は `attempts` が
+    `["jma-amedas:weather_timeout", "open-meteo:ok"]` のようになります。
 - メモリキャッシュ: 座標を小数第3位（約 100m）へ丸めたキーで
   `WEATHER_CACHE_TTL_SECONDS`（既定 120 秒）保持し、`cached=true` で返します。
 - 応答例（東京都千代田区）
@@ -457,6 +472,8 @@ curl -sS 'http://127.0.0.1:8000/api/weather?lat=35.7&lng=139.7'
 | `JMA_AMEDAS_TABLE_URL` | `https://www.jma.go.jp/bosai/amedas/const/amedastable.json` | 観測所表（緯度経度・観測要素） |
 | `OPEN_METEO_URL` | `https://api.open-meteo.com/v1/forecast` | 代替の取得先 |
 | `WEATHER_DEADLINE_SECONDS` | `8.0` | 1 リクエストで気象取得に使う総時間の上限 |
+| `WEATHER_PROVIDER_BUDGET_SECONDS` | `4.0` | 1 取得元あたりの時間予算（再試行待機を含む） |
+| `WEATHER_FALLBACK_RESERVE_SECONDS` | `3.0` | 後続の取得元（代替）のために必ず残す時間 |
 | `WEATHER_RETRY_ATTEMPTS` | `2` | 一時的な失敗の最大試行回数 |
 | `WEATHER_RETRY_BASE_SECONDS` | `0.25` | 再試行の初期待機秒（倍々、上限 `WEATHER_RETRY_MAX_SECONDS`） |
 | `WEATHER_RETRY_MAX_SECONDS` | `0.75` | 再試行待機の上限秒 |
@@ -739,11 +756,14 @@ DRONE_LOG_LIVE=1 .venv/bin/python -m unittest tests.test_infrastructure_live -v
   （ヒット／TTL 失効／キーの丸め）を検証
 - `tests/test_infrastructure_live.py`: 実 API（GSI / OSM）で品川駅・羽田・大雪山を検証。
   `DRONE_LOG_LIVE=1` を指定したときだけ実行。
-- `tests/test_weather.py`: 気象 API のオフラインテスト（`requests.get` をモック）。
-  14 桁タイムスタンプの組み立て・観測所の選択（風観測所の優先／雨量計のみへの縮退）・
-  品質フラグ付き値の除外・天候文の推定・Latest から前スロットへの遡り・全滅時の
-  エラー、キャッシュ（ヒット／TTL 失効／参考値への縮退）、API のフォールバック
-  （アメダス → Open-Meteo）・全滅時 503・座標バリデーションを検証
+- `tests/test_weather.py`: 気象 API のオフラインテスト（`requests.get` をモック、
+  一部はローカルの実 HTTP スタブ）。14 桁タイムスタンプの組み立て・観測所の選択
+  （風観測所の優先／雨量計のみへの縮退）・品質フラグ付き値の除外・天候文の推定・
+  Latest から前スロットへの遡り・全滅時のエラー、キャッシュ（ヒット／TTL 失効／
+  参考値への縮退）、API のフォールバック（アメダス → Open-Meteo）・全滅時 503・
+  座標バリデーションに加え、**取得元ごとの時間予算**（主系が遅い／接続不能でも
+  代替で 200 が返る・主系のタイムアウトは再試行しない・429 は再試行する・
+  全体 deadline 内で 504 を返す）を検証
 
 Gemini を呼ばないオフラインのユニットテストは `tests/test_diagnose.py` です
 （`_request_gemini_text` をモックし、正常系・画像検証・エラー対応を確認）。
