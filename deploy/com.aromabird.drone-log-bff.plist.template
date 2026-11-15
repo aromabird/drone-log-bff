@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!--
+        launchd（LaunchAgent）用のテンプレート。
+        リポジトリの位置・待ち受けアドレス・ポートは
+        tools/install_launchd.py がプレースホルダを実値に置き換えて
+        ~/Library/LaunchAgents/com.aromabird.drone-log-bff.plist を作ります。
+        端末固有の絶対パスをリポジトリに保存しないため、このファイルを
+        そのまま ~/Library/LaunchAgents へコピーしないでください。
+    -->
+    <key>Label</key>
+    <string>com.aromabird.drone-log-bff</string>
+    <key>WorkingDirectory</key>
+    <string>__REPO_DIR__</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO_DIR__/.venv/bin/uvicorn</string>
+        <string>main:app</string>
+        <string>--host</string>
+        <string>__HOST__</string>
+        <string>--port</string>
+        <string>__PORT__</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/drone-log-bff.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/drone-log-bff.err</string>
+</dict>
+</plist>

@@ -8,3 +8,5 @@ data/
 .env
 .env.*
 !.env.example
+# 飛行記録の書き出し（個人データ・コードからは参照しない）
+docs/*.xlsx

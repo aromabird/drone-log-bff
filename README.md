@@ -82,6 +82,23 @@ mac-mini-m4 では launchd の `com.aromabird.drone-log-bff` が起動を管理�
   StandardErrorPath: /tmp/drone-log-bff.err
 ```
 
+plist の実体は `deploy/com.aromabird.drone-log-bff.plist.template` で、パスは
+`__REPO_DIR__` のプレースホルダになっています（clone した端末ごとに解決するため、
+リポジトリに端末固有の絶対パスを保存しません）。設置・更新は同梱のインストーラで行います。
+
+```bash
+# 生成内容の確認だけ（~/Library/LaunchAgents へは書き込まない）
+.venv/bin/python tools/install_launchd.py --dry-run
+
+# 生成して設置（既存ファイルが違うときは --force が必要・.bak を自動作成）
+.venv/bin/python tools/install_launchd.py
+
+# 設置して launchd を読み直す（BFF が数秒再起動する）
+.venv/bin/python tools/install_launchd.py --reload
+```
+
+`--host` / `--port` で待ち受けを変更できます（既定は `0.0.0.0:8000`）。
+
 PWA は HTTPS で配信されるため、BFF も HTTPS でアクセスできる必要があります。
 `tailscale serve` が tailnet 内の HTTPS（443）を `127.0.0.1:8000` へプロキシします。
 
