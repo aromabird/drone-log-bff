@@ -257,6 +257,10 @@ curl -sS -X POST -H 'Content-Type: application/json' \
     立て、PWA は「異常なし」ではなく「判定不能」と表示します。空港周辺は同梱データから判定できるため、
     時間切れでも `legal_flags` / `category_min` に反映します。
   - PWA 側は 12 秒で打ち切り、無応答時は 10 秒で 1 回だけ自動再試行します（実機 5G の余裕を確保）。
+  - PWA は `legal_flags` を特定飛行10項目へ **追加のみ** 反映し（解除はしない）、`is_did=true` のときは
+    「人または物件から30m未満」も併せて ON にします。`category_min` は
+    「空域の下限: カテゴリーⅡB以上」のように表示し、最終カテゴリーは PWA 側で
+    機体重量（25kg 以上）と立入管理措置を含めて再計算します。
 
 ```json
 {
@@ -429,6 +433,42 @@ OSM API の bbox は半径から自動計算し、BFF 側で点と線分の距�
     `weather_deadline_exceeded` など）。
   - 主系が遅い場合は `attempts` が
     `["jma-amedas:weather_timeout", "open-meteo:ok"]` のようになります。
+- フェイルセーフの流れ（上から順に試します）
+
+```text
+GET /api/weather?lat=..&lng=..
+  ├─ メモリキャッシュ（120 秒・座標は約100mに丸め）──→ 200（cached=true）
+  ├─ ① 気象庁アメダス（予算 4 秒 / 1 回の HTTP は 2.5 秒）
+  │     └─ タイムアウトは再試行せず、すぐ ② へ回す
+  ├─ ② Open-Meteo（残り時間。全体 8 秒以内）
+  └─ ③ 30 分以内のキャッシュがあれば 200 + stale=true（参考値）
+        └─ それも無ければ 502 / 503 / 504 + エラーコード
+```
+
+- `attempts` の表記（`<取得元>:<結果>`）
+
+| 表記 | 意味 |
+|---|---|
+| `jma-amedas:ok` | 気象庁アメダスで取得 |
+| `open-meteo:ok` | 代替で取得（主系が失敗した場合） |
+| `:weather_timeout` | その取得元の時間予算切れ（主系では再試行しない） |
+| `:weather_unavailable` | 接続失敗・DNS 失敗・TLS 失敗など |
+| `:weather_invalid_response` | JSON でない・必要な値が欠けている |
+| `:deadline` | 全体の時間予算に収まらず、その取得元を試していない |
+
+- PWA（`drone-log`）との契約
+  - PWA は **12 秒** で打ち切ります（BFF の 8 秒より後）。BFF が 8 秒で構造化エラーを返すため、
+    通常は PWA 側のタイムアウトに到達しません。
+  - PWA が BFF に接続できない（`TypeError`・タイムアウト）ときだけ、Open-Meteo を **直接** 取得します
+    （8 秒）。その場合 `source=open-meteo` / `sourceLabel='Open-Meteo（直接取得）'` として表示されます。
+  - 画面は `source_label` / `station`（観測所名・距離）/ `weather.observed_at` / `notes` / `stale` を
+    そのまま表示します。`stale=true` のときは「参考値」の注記を出します。
+  - `weather.wind_speed` が `null`（雨量計のみの観測所など）のとき、PWA は「良好」ではなく
+    **判定不可（UNKNOWN）** と表示します。突風 `wind_gust` はアメダスでは常に `null` です。
+  - レスポンスのキーを変える場合は、PWA の `normalizeWeatherFromBff()` と同時に更新してください。
+- 回帰確認（実測）: 主系の `latest_time.txt` を 3 秒遅延させたスタブに対して、
+  **2.99 秒で 200 / `source=open-meteo` / `attempts=["jma-amedas:weather_timeout","open-meteo:ok"]`**。
+  修正前（主系の再試行が全体予算を消費）は 9.17 秒で 5xx になっていました。
 - メモリキャッシュ: 座標を小数第3位（約 100m）へ丸めたキーで
   `WEATHER_CACHE_TTL_SECONDS`（既定 120 秒）保持し、`cached=true` で返します。
 - 応答例（東京都千代田区）
