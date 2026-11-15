@@ -28,6 +28,7 @@ import plistlib
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -69,6 +70,17 @@ def validate(text: str, port: int) -> None:
     problems.extend(token for token in PLACEHOLDERS if token in text)
     if problems:
         raise SystemExit("plist の検証に失敗しました: " + ", ".join(problems))
+
+
+def _wait_running(target: str, timeout: float = 5.0) -> bool:
+    """launchctl の状態が `running` になるまで待つ。"""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        res = subprocess.run(["launchctl", "print", target], capture_output=True, text=True)
+        if res.returncode == 0 and "state = running" in res.stdout:
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def main() -> int:
@@ -133,16 +145,42 @@ def main() -> int:
 
     target = f"gui/{os.getuid()}/{LABEL}"
     subprocess.run(["launchctl", "bootout", target], capture_output=True, check=False)
+
+    # `bootout` は非同期に完了するため、直後の `bootstrap` が
+    # "Bootstrap failed: 5: Input/output error" で失敗することがある
+    # （2026-11-15 実測）。少し待って数回まで再試行する。
     res = subprocess.run(
         ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(args.dest)],
         capture_output=True,
         text=True,
     )
+    delay = 0.5
+    for _ in range(3):
+        if res.returncode == 0:
+            break
+        time.sleep(delay)
+        delay *= 2
+        res = subprocess.run(
+            ["launchctl", "bootstrap", f"gui/{os.getuid()}", str(args.dest)],
+            capture_output=True,
+            text=True,
+        )
     if res.returncode != 0:
         detail = (res.stderr or res.stdout).strip()
         print(f"launchctl bootstrap 失敗: {detail}", file=sys.stderr)
+        print(
+            "手動で再実行してください: "
+            f"launchctl bootstrap gui/$(id -u) {args.dest}",
+            file=sys.stderr,
+        )
         return res.returncode
-    print(f"reload  : {target}")
+    if not _wait_running(target):
+        print(
+            f"⚠️  {target} が running になりません。`launchctl print {target}` を確認してください。",
+            file=sys.stderr,
+        )
+        return 1
+    print(f"reload  : {target}（state = running）")
     return 0
 
 

@@ -99,6 +99,11 @@ plist の実体は `deploy/com.aromabird.drone-log-bff.plist.template` で、パ
 
 `--host` / `--port` で待ち受けを変更できます（既定は `0.0.0.0:8000`）。
 
+`--reload` は `launchctl bootout` → `bootstrap` を実行します。`bootout` の完了は非同期で、
+直後の `bootstrap` が `Bootstrap failed: 5: Input/output error` を返すことがあるため、
+インストーラは間隔を空けて最大 4 回まで再試行し、最後に `launchctl print` で
+`state = running` を確認してから終了します（2026-11-15 実測）。
+
 PWA は HTTPS で配信されるため、BFF も HTTPS でアクセスできる必要があります。
 `tailscale serve` が tailnet 内の HTTPS（443）を `127.0.0.1:8000` へプロキシします。
 
