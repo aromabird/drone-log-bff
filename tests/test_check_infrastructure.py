@@ -11,6 +11,7 @@ import asyncio
 import sys
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from typing import Iterator
 from unittest.mock import patch
@@ -101,6 +102,13 @@ class CheckInfrastructureTests(unittest.TestCase):
         self.assertEqual(body["towers_count"], 1)
         self.assertEqual(body["lines_count"], 1)
         self.assertTrue(body["power_risk_detected"])
+        # 日の出・日の入りは常に返す（ローカル計算・外部通信なし）。
+        self.assertEqual(
+            set(body["sun_times"]),
+            {"sunrise", "sunset", "is_night", "is_twilight_margin"},
+        )
+        self.assertRegex(body["sun_times"]["sunrise"], r"^\d{2}:\d{2}$")
+        self.assertRegex(body["sun_times"]["sunset"], r"^\d{2}:\d{2}$")
         post.assert_not_called()
 
     def _get_airspace(
@@ -269,6 +277,61 @@ class CheckInfrastructureTests(unittest.TestCase):
         self.assertTrue(body["legal_unknown"])
         self.assertIsNone(body["is_did"])
         self.assertIn("DIPS", body["message"])
+        # 時間切れの縮退でも日の出・日の入りは返す（ローカル計算のため）。
+        self.assertEqual(
+            set(body["sun_times"]),
+            {"sunrise", "sunset", "is_night", "is_twilight_margin"},
+        )
+
+    def test_sun_times_are_formatted_from_legal(self) -> None:
+        """legal.sun_times の日時を HH:MM に整形して返すこと。"""
+
+        fake = {
+            "sunrise": datetime(2026, 11, 19, 6, 20, tzinfo=main.JST),
+            "sunset": datetime(2026, 11, 19, 16, 31, tzinfo=main.JST),
+            "is_night": False,
+            "is_twilight_margin": True,
+        }
+        with patch("legal.sun_times", return_value=fake), patch(
+            "main.requests.get", return_value=FakeResponse(OSM_XML)
+        ), patch("main.requests.post"), patch(
+            "legal.fetch_did_status", return_value=(False, "テスト用のDID判定")
+        ):
+            response = self._get()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["sun_times"],
+            {
+                "sunrise": "06:20",
+                "sunset": "16:31",
+                "is_night": False,
+                "is_twilight_margin": True,
+            },
+        )
+
+    def test_sun_times_failure_does_not_break_response(self) -> None:
+        """天文計算が失敗しても、空域・インフラの判定は 200 で返すこと。"""
+
+        with patch(
+            "legal.sun_times", side_effect=RuntimeError("astral failure")
+        ), patch(
+            "main.requests.get", return_value=FakeResponse(OSM_XML)
+        ), patch("main.requests.post"), patch(
+            "legal.fetch_did_status", return_value=(False, "テスト用のDID判定")
+        ):
+            response = self._get()
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["sun_times"],
+            {
+                "sunrise": None,
+                "sunset": None,
+                "is_night": False,
+                "is_twilight_margin": False,
+            },
+        )
 
     def test_slow_did_does_not_block_infra_result(self) -> None:
         """DID が遅くても、インフラ結果は返し DID だけ判定不能にすること。"""

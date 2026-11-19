@@ -402,6 +402,24 @@ class AirportVicinity(BaseModel):
     nearby: bool = Field(..., description="12km 以内（進入表面等の可能性あり）")
 
 
+class SunTimes(BaseModel):
+    """日の出・日の入り（JST）と夜間・薄明の判定。"""
+
+    sunrise: str | None = Field(
+        None, description="日の出時刻（HH:MM・JST）。判定不能なら null"
+    )
+    sunset: str | None = Field(
+        None, description="日の入り時刻（HH:MM・JST）。判定不能なら null"
+    )
+    is_night: bool = Field(
+        False, description="日の出より前、または日の入り以降（法令上の夜間）なら true"
+    )
+    is_twilight_margin: bool = Field(
+        False,
+        description="日の出・日の入りの前後30分以内（薄明の安全マージン）なら true",
+    )
+
+
 class InfrastructureRisk(BaseModel):
     """周辺インフラ（送電線・鉄塔）と空域（DID・空港）のチェック結果。"""
 
@@ -463,6 +481,10 @@ class InfrastructureRisk(BaseModel):
             "同じエリア（緯度・経度を小数第3位で丸めた値＋半径）のキャッシュを"
             "返したか。true でも source / counts は前回取得した実データ"
         ),
+    )
+    sun_times: SunTimes = Field(
+        default_factory=SunTimes,
+        description="日の出・日の入り（JST）と夜間・薄明の判定（ローカル計算）",
     )
 
 
@@ -1628,6 +1650,26 @@ def _fetch_did_result(
         return None, legal.DID_NOTE_UNKNOWN
 
 
+def _sun_times_for(lat: float, lon: float) -> SunTimes:
+    """日の出・日の入りと夜間・薄明の判定を返す（ローカル計算のみ）。
+
+    天文計算に失敗しても、周辺インフラ・空域の判定を止めない。
+    """
+
+    try:
+        times = legal.sun_times(lat, lon)
+    except Exception:  # pragma: no cover - 想定外の失敗で本処理を止めない
+        logger.exception("sun times failed unexpectedly")
+        return SunTimes()
+
+    return SunTimes(
+        sunrise=legal.format_sun_time(times["sunrise"]),
+        sunset=legal.format_sun_time(times["sunset"]),
+        is_night=bool(times["is_night"]),
+        is_twilight_margin=bool(times["is_twilight_margin"]),
+    )
+
+
 def _degraded_infra_result(
     lat: float,
     lon: float,
@@ -1635,6 +1677,7 @@ def _degraded_infra_result(
     is_did: bool | None,
     did_note: str,
     started: float,
+    sun_times: SunTimes,
 ) -> InfrastructureRisk:
     """全体の時間切れで判定できなかったときの安全側の既定値を返す。
 
@@ -1658,12 +1701,14 @@ def _degraded_infra_result(
 
     logger.warning(
         "check-infrastructure degraded: lat=%.6f lon=%.6f radius=%d did=%s "
-        "category=%s elapsed_ms=%d",
+        "category=%s night=%s twilight=%s elapsed_ms=%d",
         lat,
         lon,
         radius,
         is_did,
         category_code,
+        sun_times.is_night,
+        sun_times.is_twilight_margin,
         elapsed_ms,
     )
 
@@ -1689,6 +1734,7 @@ def _degraded_infra_result(
         category_reasons=airspace["category_reasons"],
         # DID まで判定できていた場合は「判定不能」にしない（空域は確定している）。
         legal_unknown=is_did is None,
+        sun_times=sun_times,
     )
 
 
@@ -1732,6 +1778,9 @@ async def check_infrastructure(
     """
 
     started = time.monotonic()
+    # 日の出・日の入りは astral によるローカル計算（外部通信なし）。
+    # 気象・OSM のタイムバジェットには含めない。
+    sun_times = _sun_times_for(lat, lon)
     budget = max(0.5, INFRA_TOTAL_TIMEOUT_SECONDS)
     infra_deadline = started + min(INFRA_DEADLINE_SECONDS, budget)
     did_deadline = min(infra_deadline, started + INFRA_LEGAL_TIMEOUT_SECONDS)
@@ -1785,7 +1834,7 @@ async def check_infrastructure(
 
     if source == "unknown":
         return _degraded_infra_result(
-            lat, lon, radius, is_did, did_note, started
+            lat, lon, radius, is_did, did_note, started, sun_times
         )
 
     power_risk_detected = towers_count > 0 or lines_count > 0
@@ -1834,7 +1883,7 @@ async def check_infrastructure(
     logger.info(
         "check-infrastructure: lat=%.6f lon=%.6f radius=%d towers=%d lines=%d "
         "source=%s did=%s airport=%s distance_m=%s category=%s basis=%s "
-        "cached=%s elapsed_ms=%d",
+        "cached=%s night=%s twilight=%s sunrise=%s sunset=%s elapsed_ms=%d",
         lat,
         lon,
         radius,
@@ -1847,6 +1896,10 @@ async def check_infrastructure(
         category_code,
         category_basis,
         infra_cached,
+        sun_times.is_night,
+        sun_times.is_twilight_margin,
+        sun_times.sunrise or "-",
+        sun_times.sunset or "-",
         elapsed_ms,
     )
 
@@ -1871,6 +1924,7 @@ async def check_infrastructure(
         category_label=category_label,
         category_reasons=airspace["category_reasons"],
         legal_unknown=airspace["legal_unknown"],
+        sun_times=sun_times,
     )
 
 
@@ -2838,6 +2892,10 @@ class WeatherResult(BaseModel):
     stale: bool = Field(False, description="古いキャッシュによる参考値か")
     elapsed_ms: int = Field(0, ge=0, description="BFF の処理時間（ms）")
     fetched_at: str = Field(..., description="BFF が応答を作成した時刻（JST）")
+    sun_times: SunTimes = Field(
+        default_factory=SunTimes,
+        description="日の出・日の入り（JST）と夜間・薄明の判定（ローカル計算）",
+    )
 
 
 def _weather_provider_deadline(
@@ -3011,9 +3069,12 @@ def get_weather(
 
     observation = payload.get("weather") or {}
     station = payload.get("station") or {}
+    # 天文計算はローカルで完結するため、気象取得の成否や時間予算に影響しない。
+    sun_times = _sun_times_for(lat, lng)
     logger.info(
         "weather ok: lat=%.6f lng=%.6f source=%s station=%s distance_km=%s "
-        "wind=%s temp=%s cached=%s stale=%s elapsed_ms=%d attempts=%s",
+        "wind=%s temp=%s cached=%s stale=%s night=%s twilight=%s "
+        "sunrise=%s sunset=%s elapsed_ms=%d attempts=%s",
         lat,
         lng,
         payload.get("source"),
@@ -3023,12 +3084,17 @@ def get_weather(
         observation.get("temperature"),
         payload.get("cached"),
         payload.get("stale"),
+        sun_times.is_night,
+        sun_times.is_twilight_margin,
+        sun_times.sunrise or "-",
+        sun_times.sunset or "-",
         payload.get("elapsed_ms", 0),
         ",".join(payload.get("attempts") or []) or "-",
     )
 
     return WeatherResult(
         **payload,
+        sun_times=sun_times,
         fetched_at=datetime.now(JST).isoformat(timespec="seconds"),
     )
 

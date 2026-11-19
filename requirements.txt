@@ -11,3 +11,5 @@ python-dotenv>=1.0,<2.0
 # 気象データ取得の指数バックオフ再試行（純 Python・推移依存なし）
 # `wait_exponential_jitter(multiplier=...)` は tenacity 9.0 以降の名前。
 tenacity>=9.0,<10.0
+# 日の出・日の入りの天文計算（astral 3.2 は純 Python・外部通信なし）
+astral>=3.2,<4.0

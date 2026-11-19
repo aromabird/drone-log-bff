@@ -405,6 +405,32 @@ class WeatherApiTests(unittest.TestCase):
         self.assertFalse(data["cached"])
         self.assertFalse(data["stale"])
         self.assertTrue(data["fetched_at"].endswith("+09:00"))
+        # 日の出・日の入りは BFF のローカル計算（astral）で付与する。
+        self.assertEqual(
+            set(data["sun_times"]),
+            {"sunrise", "sunset", "is_night", "is_twilight_margin"},
+        )
+        self.assertRegex(data["sun_times"]["sunrise"], r"^\d{2}:\d{2}$")
+        self.assertRegex(data["sun_times"]["sunset"], r"^\d{2}:\d{2}$")
+
+    def test_sun_times_failure_does_not_break_weather(self) -> None:
+        """天文計算が失敗しても、気象のレスポンスは 200 のまま返すこと。"""
+
+        with patch(
+            "main._fetch_jma_amedas", return_value=self.open_meteo_payload()
+        ), patch("legal.sun_times", side_effect=RuntimeError("astral failure")):
+            response = client.get("/api/weather", params={"lat": LAT, "lng": LON})
+
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(
+            response.json()["sun_times"],
+            {
+                "sunrise": None,
+                "sunset": None,
+                "is_night": False,
+                "is_twilight_margin": False,
+            },
+        )
 
     def test_returns_structured_error_when_all_providers_fail(self) -> None:
         error = main.WeatherFetchError(

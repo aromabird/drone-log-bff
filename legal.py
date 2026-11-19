@@ -1,8 +1,11 @@
-"""ドローン飛行の空域判定（人口集中地区・空港等の周辺）。
+"""ドローン飛行の空域判定（人口集中地区・空港等の周辺）と日の出・日の入り。
 
 PWA の「周辺インフラのリスクチェック」に対し、航空法上の特定飛行に該当する
-空域かどうかの**参考判定**を返すモジュール。外部依存を増やさないため、画像の
-デコードは標準ライブラリ（`zlib` / `struct`）だけで行う。
+空域かどうかの**参考判定**を返すモジュール。画像のデコードは標準ライブラリ
+（`zlib` / `struct`）だけで行う。
+
+日の出・日の入りは天文計算ライブラリ `astral` で求める。**外部通信は行わない**
+ローカル計算のため、気象 API のタイムバジェットには影響しない。
 
 判定の根拠:
 
@@ -28,10 +31,14 @@ import struct
 import threading
 import time
 import zlib
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import requests
+from astral import Observer
+from astral.sun import sun
 
 logger = logging.getLogger("drone-log-bff.legal")
 
@@ -47,6 +54,12 @@ DID_FETCH_TIMEOUT = (1.5, 2.0)
 DID_SOURCE = "gsi-did2020"
 DID_CACHE_TTL_SECONDS = 24 * 60 * 60
 DID_CACHE_MAX_ENTRIES = 512
+
+# 日の出・日の入り（天文計算）。JST 固定で扱う（PWA は日本国内での運用）。
+JST = ZoneInfo("Asia/Tokyo")
+SUN_TIME_FORMAT = "%H:%M"
+# 国立天文台の発表値との誤差（±1〜2分）と薄明のリスクを見込んだ安全マージン。
+TWILIGHT_MARGIN = timedelta(minutes=30)
 
 # 空港判定のしきい値（目安）。法令上の境界は進入表面等で決まる。
 AIRPORT_VICINITY_RADIUS_M = 6000
@@ -78,6 +91,74 @@ _DID_CACHE_LOCK = threading.Lock()
 
 _AIRPORTS: list[dict[str, Any]] | None = None
 _AIRPORTS_LOCK = threading.Lock()
+
+
+def sun_times(lat: float, lon: float, when: datetime | None = None) -> dict[str, Any]:
+    """指定座標・日時の日の出／日の入りと、夜間・薄明の判定を返す。
+
+    Args:
+        lat: 緯度（北緯が正）。
+        lon: 経度（東経が正）。
+        when: 判定する日時。省略時は現在時刻。タイムゾーンが無い場合は
+            JST とみなす（サーバーのタイムゾーンには依存しない）。
+
+    Returns:
+        ``{"sunrise": datetime | None, "sunset": datetime | None,
+        "is_night": bool, "is_twilight_margin": bool}``。
+        極地方などで日の出・日の入りが存在しない日は時刻を ``None`` にし、
+        夜間・薄明は ``False`` を返す（判定不能を「安全」と混同しないため、
+        呼び出し側は時刻の ``None`` を「判定不能」として扱う）。
+
+    Note:
+        `astral` によるローカル計算のみで、外部通信は行わない。気象 API の
+        タイムバジェット（`WEATHER_PROVIDER_BUDGET_SECONDS` 等）には影響しない。
+    """
+
+    local = when if when is not None else datetime.now(JST)
+    if local.tzinfo is None:
+        local = local.replace(tzinfo=JST)
+    local = local.astimezone(JST)
+
+    try:
+        table = sun(
+            observer=Observer(latitude=lat, longitude=lon),
+            date=local.date(),
+            tzinfo=JST,
+        )
+    except ValueError:
+        # 極夜・白夜などで日の出／日の入りが存在しない日。
+        logger.warning(
+            "sun times unavailable: lat=%.4f lon=%.4f date=%s", lat, lon, local.date()
+        )
+        return {
+            "sunrise": None,
+            "sunset": None,
+            "is_night": False,
+            "is_twilight_margin": False,
+        }
+
+    sunrise = table["sunrise"].astimezone(JST)
+    sunset = table["sunset"].astimezone(JST)
+
+    # 法令上の「夜間」は日没後〜日出前。ちょうど日出時刻は夜間に含めない。
+    is_night = local < sunrise or local >= sunset
+    margin = min(abs(local - sunrise), abs(local - sunset))
+    return {
+        "sunrise": sunrise,
+        "sunset": sunset,
+        "is_night": is_night,
+        "is_twilight_margin": margin <= TWILIGHT_MARGIN,
+    }
+
+
+def format_sun_time(value: datetime | None) -> str | None:
+    """日の出・日の入りを ``HH:MM``（JST）へ整形する。``None`` はそのまま返す。"""
+
+    if value is None:
+        return None
+    return value.astimezone(JST).strftime(SUN_TIME_FORMAT)
+
+
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     """2点間の大円距離（メートル）。"""
 

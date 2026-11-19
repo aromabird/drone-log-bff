@@ -12,8 +12,10 @@ import sys
 import time
 import unittest
 import zlib
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
@@ -271,6 +273,99 @@ class JudgeTests(unittest.TestCase):
         airspace = legal.judge_airspace(*DAISETSUZAN, is_did=None)
         self.assertTrue(airspace["legal_unknown"])
         self.assertEqual(airspace["legal_flags"], [])
+
+
+class SunTimesTests(unittest.TestCase):
+    """日の出・日の入りと夜間・薄明の判定（astral・通信なし）。"""
+
+    JST = ZoneInfo("Asia/Tokyo")
+    # 東京駅付近。astral 3.2 の実測値は 2026-11-19 に 06:20 / 16:31。
+    TOKYO = (35.681236, 139.767125)
+
+    def _times(self, when: datetime) -> dict:
+        return legal.sun_times(*self.TOKYO, when=when)
+
+    def test_tokyo_sunrise_and_sunset(self) -> None:
+        times = self._times(datetime(2026, 11, 19, 12, 0, tzinfo=self.JST))
+
+        self.assertIsNotNone(times["sunrise"])
+        self.assertIsNotNone(times["sunset"])
+        self.assertEqual(times["sunrise"].strftime("%H:%M"), "06:20")
+        self.assertEqual(times["sunset"].strftime("%H:%M"), "16:31")
+        self.assertEqual(times["sunrise"].tzinfo, self.JST)
+        self.assertFalse(times["is_night"])
+        self.assertFalse(times["is_twilight_margin"])
+
+    def test_night_before_sunrise_and_after_sunset(self) -> None:
+        for hour in (3, 23):
+            times = self._times(datetime(2026, 11, 19, hour, 0, tzinfo=self.JST))
+            self.assertTrue(times["is_night"], hour)
+
+    def test_daytime_is_not_night(self) -> None:
+        times = self._times(datetime(2026, 11, 19, 12, 0, tzinfo=self.JST))
+        self.assertFalse(times["is_night"])
+
+    def test_twilight_margin_within_30_minutes(self) -> None:
+        base = self._times(datetime(2026, 11, 19, 12, 0, tzinfo=self.JST))
+        sunrise = base["sunrise"]
+        sunset = base["sunset"]
+
+        cases = [
+            (sunrise - timedelta(minutes=10), True, True),
+            (sunrise + timedelta(minutes=10), False, True),
+            (sunset - timedelta(minutes=10), False, True),
+            (sunset + timedelta(minutes=10), True, True),
+            (sunrise + timedelta(minutes=31), False, False),
+            (sunset + timedelta(minutes=31), True, False),
+        ]
+        for when, expected_night, expected_twilight in cases:
+            times = self._times(when)
+            self.assertEqual(times["is_night"], expected_night, when)
+            self.assertEqual(
+                times["is_twilight_margin"], expected_twilight, when
+            )
+
+    def test_twilight_boundary_is_inclusive(self) -> None:
+        base = self._times(datetime(2026, 11, 19, 12, 0, tzinfo=self.JST))
+        exact = self._times(base["sunrise"] - timedelta(minutes=30))
+        outside = self._times(base["sunrise"] - timedelta(minutes=30, seconds=1))
+
+        self.assertTrue(exact["is_twilight_margin"])
+        self.assertFalse(outside["is_twilight_margin"])
+
+    def test_default_when_uses_current_time(self) -> None:
+        times = legal.sun_times(*self.TOKYO)
+
+        self.assertEqual(
+            set(times),
+            {"sunrise", "sunset", "is_night", "is_twilight_margin"},
+        )
+        self.assertIsNotNone(times["sunrise"])
+        self.assertEqual(times["sunrise"].tzinfo, self.JST)
+
+    def test_naive_datetime_is_treated_as_jst(self) -> None:
+        aware = self._times(datetime(2026, 11, 19, 12, 0, tzinfo=self.JST))
+        naive = self._times(datetime(2026, 11, 19, 12, 0))
+
+        self.assertEqual(aware["sunrise"], naive["sunrise"])
+        self.assertEqual(aware["is_night"], naive["is_night"])
+
+    def test_polar_night_returns_none_without_raising(self) -> None:
+        times = legal.sun_times(
+            78.0, 15.0, when=datetime(2026, 12, 21, 12, 0, tzinfo=self.JST)
+        )
+
+        self.assertIsNone(times["sunrise"])
+        self.assertIsNone(times["sunset"])
+        self.assertFalse(times["is_night"])
+        self.assertFalse(times["is_twilight_margin"])
+
+    def test_format_sun_time(self) -> None:
+        self.assertEqual(
+            legal.format_sun_time(datetime(2026, 11, 19, 6, 20, tzinfo=self.JST)),
+            "06:20",
+        )
+        self.assertIsNone(legal.format_sun_time(None))
 
 
 if __name__ == "__main__":

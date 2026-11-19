@@ -340,6 +340,12 @@ curl -sS "http://127.0.0.1:8000/api/flight-records?status=pre_flight_ready"
   "power_risk_detected": false,
   "power_unknown": false,
   "cached": false,
+  "sun_times": {
+    "sunrise": "06:20",
+    "sunset": "16:31",
+    "is_night": false,
+    "is_twilight_margin": false
+  },
   "towers_count": 0,
   "lines_count": 0,
   "message": "人口集中地区（DID）の上空のため特定飛行に該当します（カテゴリーⅡB以上）。周辺インフラ（送電線・鉄塔）の異常なし",
@@ -388,6 +394,17 @@ curl -sS "http://127.0.0.1:8000/api/flight-records?status=pre_flight_ready"
 | `legal_unknown` | `true` のときは DID を判定できていない（DIPS での確認が必要） |
 | `power_unknown` | `true` のときは送電線・鉄塔を判定できていない。`towers_count=0` は「0 件」ではなく「不明」 |
 | `cached` | `true` のときは同じエリア（約 100m 単位＋半径）のキャッシュを返した。`source` / 件数は前回取得した実データ |
+| `sun_times` | 日の出・日の入り（`HH:MM`・JST）と夜間・薄明の判定。`astral` による**ローカル計算**（外部通信なし） |
+
+`sun_times` の判定:
+
+- `is_night`: 対象時刻が日の出より前、または日の入り以降（法令上の「夜間飛行」）。
+- `is_twilight_margin`: 日の出・日の入りの前後 **30分以内**。国立天文台の発表値との
+  誤差（±1〜2分）と薄明のリスクを見込んだ安全マージンで、**警告表示のみ**に使います。
+- 判定はリクエスト時刻（JST）基準です。極地方などで日の出・日の入りが存在しない日は
+  `sunrise` / `sunset` が `null` になります（この場合 `is_night` は `false`）。
+- 計算は `legal.sun_times()` が行い、**気象・OSM のタイムバジェットには含めません**
+  （`WEATHER_PROVIDER_BUDGET_SECONDS` / `INFRA_TOTAL_TIMEOUT_SECONDS` は不変）。
 
 判定の考え方:
 
@@ -538,6 +555,9 @@ GET /api/weather?lat=..&lng=..
     そのまま表示します。`stale=true` のときは「参考値」の注記を出します。
   - `weather.wind_speed` が `null`（雨量計のみの観測所など）のとき、PWA は「良好」ではなく
     **判定不可（UNKNOWN）** と表示します。突風 `wind_gust` はアメダスでは常に `null` です。
+  - `sun_times` は天候の取得成否に依存しない**ローカル計算**です。PWA は日の出・日の入りを表示し、
+    `is_night=true` のときだけ「夜間飛行」を **追加のみ** 自動ONします（`is_twilight_margin` は警告のみ）。
+    Open-Meteo を直接取得した場合（BFF 不達時）は `sun_times` が付かないため、画面は行ごと非表示にします。
   - レスポンスのキーを変える場合は、PWA の `normalizeWeatherFromBff()` と同時に更新してください。
 - 回帰確認（実測）: 主系の `latest_time.txt` を 3 秒遅延させたスタブに対して、
   **2.99 秒で 200 / `source=open-meteo` / `attempts=["jma-amedas:weather_timeout","open-meteo:ok"]`**。
@@ -570,6 +590,12 @@ GET /api/weather?lat=..&lng=..
   "cached": false,
   "stale": false,
   "elapsed_ms": 210,
+  "sun_times": {
+    "sunrise": "06:20",
+    "sunset": "16:31",
+    "is_night": false,
+    "is_twilight_margin": false
+  },
   "fetched_at": "2026-11-15T10:34:12+09:00"
 }
 ```
@@ -859,14 +885,15 @@ DRONE_LOG_LIVE=1 .venv/bin/python -m unittest tests.test_infrastructure_live -v
 ```
 
 - `tests/test_legal.py`: PNG デコード（フィルタ0〜4）・タイル座標・
-  DID の 404 / 不透明 / 透明 / タイムアウト・空港距離・カテゴリー判定
+  DID の 404 / 不透明 / 透明 / タイムアウト・空港距離・カテゴリー判定・
+  日の出/日の入り（夜間・薄明30分・極地方の `None` 返却）
 - `tests/test_check_infrastructure.py`: 取得元の切り替え・deadline・
   `asyncio` の並列実行（DID と OSM が直列にならないこと）・全体タイムアウト時の
   安全側の既定値（`power_unknown`）・DID だけが遅い場合の部分結果に加え、
   DID 内 → ⅡB / 空港周辺 → ⅡA / DID 外 → Ⅰ / 判定不能 / 送電線のみ（安全上）、
   さらに Overpass ミラーのフォールバック・指数バックオフ再試行（成功／打ち切り／
   deadline 不足時のスキップ）・恒久的エラーの再試行なし・キャッシュ
-  （ヒット／TTL 失効／キーの丸め）を検証
+  （ヒット／TTL 失効／キーの丸め）・`sun_times` の整形と天文計算失敗時の安全側応答を検証
 - `tests/test_infrastructure_live.py`: 実 API（GSI / OSM）で品川駅・羽田・大雪山を検証。
   `DRONE_LOG_LIVE=1` を指定したときだけ実行。
 - `tests/test_weather.py`: 気象 API のオフラインテスト（`requests.get` をモック、
@@ -876,7 +903,7 @@ DRONE_LOG_LIVE=1 .venv/bin/python -m unittest tests.test_infrastructure_live -v
   参考値への縮退）、API のフォールバック（アメダス → Open-Meteo）・全滅時 503・
   座標バリデーションに加え、**取得元ごとの時間予算**（主系が遅い／接続不能でも
   代替で 200 が返る・主系のタイムアウトは再試行しない・429 は再試行する・
-  全体 deadline 内で 504 を返す）を検証
+  全体 deadline 内で 504 を返す）・`sun_times` の付与と天文計算失敗時も 200 を維持することを検証
 
 Gemini を呼ばないオフラインのユニットテストは `tests/test_diagnose.py` です
 （`_request_gemini_text` をモックし、正常系・画像検証・エラー対応を確認）。
@@ -959,7 +986,7 @@ cd drone-log-bff
 ```text
 drone-log-bff/
 ├── main.py
-├── legal.py                   # DID（地理院タイル）/ 空港周辺の判定・カテゴリー下限
+├── legal.py                   # DID（地理院タイル）/ 空港周辺の判定・カテゴリー下限・日の出/日の入り
 ├── requirements.txt
 ├── .gitignore
 ├── README.md
@@ -990,4 +1017,4 @@ drone-log-bff/
 
 テスト用ログの出典とライセンスは
 [`tests/fixtures/README.md`](tests/fixtures/README.md) に記載しています。
-`pydjirecord` は MIT ライセンスです。
+`pydjirecord` は MIT ライセンス、`astral` は Apache License 2.0 です。
