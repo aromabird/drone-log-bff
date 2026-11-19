@@ -242,6 +242,57 @@ curl -sS -X POST -H 'Content-Type: application/json' \
 - `data/` は `.gitignore` 対象です。ディレクトリは `0700`、`backup.json` は `0600` で作成します。
 - 操縦者名・技能証明番号・連絡先などの個人情報を含むため、BFF を一般公開しないでください。
 
+### `POST /api/flight-records` / `GET /api/flight-records`
+
+PWA の飛行記録（`status` と日常点検13項目）を保存・同期するAPIです。
+PWA は localStorage を正とし、保存時にこのAPIへベストエフォートで送信します（オフラインでも記録は失われません）。
+
+- `POST /api/flight-records`
+  - リクエスト（抜粋）:
+
+```json
+{
+  "flight_id": null,
+  "status": "pre_flight_ready",
+  "date": "2026-11-15",
+  "pilot_id": "PLT-0001",
+  "drone_id": "DRN-0001",
+  "takeoff_place": "千葉県香取市小見川",
+  "takeoff_time": "",
+  "landing_time": "",
+  "duration_min": 0,
+  "specific_flags": ["非特定飛行"],
+  "has_clear_zone": true,
+  "category": "カテゴリーⅠ",
+  "purpose": "空撮",
+  "inspections": [
+    {
+      "type": "飛行前",
+      "inspection_date": "2026-11-15",
+      "inspector": "普施 太郎",
+      "result": "合格",
+      "memo": "",
+      "items": {"機体全般": "OK", "プロペラ": "OK", "…": "OK"}
+    }
+  ]
+}
+```
+
+  - `status` 省略時は `completed` として扱います（後方互換）。
+  - `status: "completed"` は **飛行前・飛行後の2件**、`HH:MM` の離着陸時刻、1分以上の飛行時間が必要です。
+  - `inspections[].items` は **13項目すべて**（`OK` / `NG`）が必要です。不足は `422`。
+  - `flight_id` を付けると既存レコードを更新します（存在しないIDは `404`）。完了保存は同じIDで update します。
+  - 成功レスポンス: `{"ok": true, "record": {... "flight_id": "FLT-0001", "created_at": "...", "updated_at": "..."}}`
+- `GET /api/flight-records?status=pre_flight_ready&limit=200`
+  - `status` は `pre_flight_ready` / `completed` のみ。`updated_at` の新しい順で返します。
+- 保存先は `data/flight_records.json`（ディレクトリ `0700` / ファイル `0600`）。
+  最大 5,000 件・10MB、`asyncio.Lock` と一時ファイル経由の atomic replace で書き込みます。
+
+```bash
+curl -sS "http://127.0.0.1:8000/api/flight-records?status=pre_flight_ready"
+# 13項目を含む完全なサンプルは tests/flight_records_test.sh が生成するJSONを参照
+```
+
 ### `GET /api/check-infrastructure`
 
 指定座標の**空域（人口集中地区・空港等の周辺）**と、半径 `radius` メートル以内の
@@ -854,6 +905,28 @@ cd drone-log-bff
 
 最後に `ALL BACKUP TESTS PASSED` を表示します。
 
+### 飛行記録APIのテスト
+
+`tests/flight_records_test.sh` は一時データディレクトリ・別ポート（既定: 8012）で BFF を起動し、
+`/api/flight-records` のスキーマ検証と upsert を確認します。
+
+```bash
+cd drone-log-bff
+./tests/flight_records_test.sh
+```
+
+1. 空の `GET` → `records: []`
+2. `pre_flight_ready`（離着陸時刻なし）→ `200` / `FLT-0001`
+3. `completed` で飛行後点検なし → `422`
+4. 不正な `status` → `422`
+5. 点検項目が12件 → `422`
+6. 同じ `flight_id` で `completed` → 1件のまま更新（点検2件）
+7. `?status=pre_flight_ready` / `?status=completed` の絞り込み
+8. `data/flight_records.json` の権限 `600`
+9. `export-log` が `status` / `inspections` を受け入れる
+
+最後に「すべての flight-records テストが成功しました。」を表示します。
+
 ## CORS
 
 `allow_credentials=False`（cookie を使わない）のうえで、以下のオリジンだけを許可します。
@@ -897,13 +970,15 @@ drone-log-bff/
 ├── tools/
 │   └── build_airports_json.py # airports_jp.json の再生成
 ├── data/                      # 実行時に自動作成（.gitignore / 0700）
-│   └── backup.json            # PWAのlocalStorageバックアップ（0600）
+│   ├── backup.json            # PWAのlocalStorageバックアップ（0600）
+│   └── flight_records.json    # status付き飛行記録（0600 / 最大5000件）
 └── tests/
     ├── sample_dji.txt          # 実ログ v4（Details フォールバック検証）
     ├── invalid_dji.txt         # 解析失敗の検証
     ├── export_sample.json      # export-log のリクエスト例
     ├── smoke_test.sh
     ├── backup_test.sh          # バックアップAPI（一時データディレクトリ）
+    ├── flight_records_test.sh  # /api/flight-records（status・点検13項目）
     ├── test_legal.py           # DID / 空港判定のオフラインテスト
     ├── test_infrastructure_live.py  # 実 API テスト（DRONE_LOG_LIVE=1）
     └── fixtures/

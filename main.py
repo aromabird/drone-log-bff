@@ -43,7 +43,7 @@ from fastapi import FastAPI, File, HTTPException, Query, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from openpyxl import load_workbook
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from pydjirecord import DJILog
 from tenacity import (
     Retrying,
@@ -87,6 +87,34 @@ BACKUP_PATH = DATA_DIR / "backup.json"
 BACKUP_TMP_PATH = DATA_DIR / "backup.json.tmp"
 MAX_BACKUP_BYTES = 10 * 1024 * 1024
 BACKUP_LOCK = asyncio.Lock()
+
+# 飛行記録（status 付き）の保存先。PWA の localStorage と同期するサーバー側の控え。
+# 点検結果を含むため backup.json と同じく 0600 で保存する。
+FLIGHT_RECORDS_PATH = DATA_DIR / "flight_records.json"
+FLIGHT_RECORDS_TMP_PATH = DATA_DIR / "flight_records.json.tmp"
+FLIGHT_RECORDS_LOCK = asyncio.Lock()
+MAX_FLIGHT_RECORDS = 5000
+MAX_FLIGHT_RECORDS_BYTES = 10 * 1024 * 1024
+
+# 様式2の日常点検13項目（PWA の ITEM_NAMES と一致させる）。
+INSPECTION_ITEM_NAMES = (
+    "機体全般",
+    "プロペラ",
+    "フレーム",
+    "通信系統",
+    "推進系統",
+    "電源系統",
+    "自動制御系統",
+    "操縦装置",
+    "バッテリー・燃料",
+    "機体識別表示",
+    "リモートID",
+    "灯火",
+    "カメラ",
+)
+
+# 離着陸時刻は HH:MM のみ受け付ける。
+HHMM_PATTERN = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 # AI 飛行前診断（Gemini API）。
 #
@@ -439,6 +467,26 @@ class InfrastructureRisk(BaseModel):
 
 
 
+class InspectionRecord(BaseModel):
+    """日常点検1回分（様式2・13項目）。"""
+
+    type: Literal["飛行前", "飛行後"]
+    inspection_date: str = Field("", max_length=32, description="点検実施日")
+    inspector: str = Field("", max_length=120, description="実施者")
+    result: Literal["合格", "異常あり"] = "合格"
+    memo: str = Field("", max_length=1000)
+    items: dict[str, Literal["OK", "NG"]] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _require_all_items(self) -> "InspectionRecord":
+        """13項目すべての入力（OK / NG）を必須にする。"""
+
+        missing = [name for name in INSPECTION_ITEM_NAMES if name not in self.items]
+        if missing:
+            raise ValueError(f"未入力の点検項目があります: {'、'.join(missing)}")
+        return self
+
+
 class FlightRecord(BaseModel):
     """飛行日誌（Excel）へ書き出す 1 飛行分の入力。"""
 
@@ -452,6 +500,56 @@ class FlightRecord(BaseModel):
     total_time: str = Field(..., max_length=32, description="飛行時間（表示用）")
     safety_measures: str = Field("", max_length=500, description="安全対策")
     notes: str = Field("", max_length=1000, description="備考")
+    # PWA の status 付き記録をそのまま受け取れるよう任意項目として追加（未指定は completed）。
+    status: Literal["pre_flight_ready", "completed"] = "completed"
+    inspections: list[InspectionRecord] = Field(default_factory=list)
+
+
+class FlightRecordPayload(BaseModel):
+    """飛行記録（status 付き）。PWA の localStorage と同期する。"""
+
+    flight_id: str | None = Field(None, max_length=64)
+    status: Literal["pre_flight_ready", "completed"] = "completed"
+    date: str = Field(..., max_length=32)
+    pilot_id: str = Field("", max_length=64)
+    drone_id: str = Field("", max_length=64)
+    takeoff_place: str = Field(..., max_length=240)
+    landing_place: str = Field("", max_length=240)
+    lat: float | None = Field(None, ge=-90, le=90)
+    lng: float | None = Field(None, ge=-180, le=180)
+    takeoff_time: str = Field("", max_length=16)
+    landing_time: str = Field("", max_length=16)
+    duration_min: int = Field(0, ge=0, le=1440)
+    specific_flags: list[str] = Field(default_factory=list)
+    has_clear_zone: bool = True
+    category: str = Field("", max_length=32)
+    purpose: str = Field("", max_length=120)
+    safety_event: str = Field("なし", max_length=500)
+    inspections: list[InspectionRecord] = Field(default_factory=list)
+    preflight_saved_at: str = Field("", max_length=32)
+    completed_at: str = Field("", max_length=32)
+
+    @model_validator(mode="after")
+    def _validate_status(self) -> "FlightRecordPayload":
+        """status と点検データの整合性を検証する（後方互換: status 省略=completed）。"""
+
+        types = [item.type for item in self.inspections]
+        if len(types) != len(set(types)):
+            raise ValueError("点検種別が重複しています。")
+        if "飛行前" not in types:
+            raise ValueError("飛行前点検がありません。")
+        if self.status == "completed":
+            if "飛行後" not in types:
+                raise ValueError("完了（completed）には飛行後点検が必要です。")
+            for label, value in (
+                ("離陸時刻", self.takeoff_time),
+                ("着陸時刻", self.landing_time),
+            ):
+                if not HHMM_PATTERN.match(value or ""):
+                    raise ValueError(f"{label}は HH:MM 形式で指定してください。")
+            if self.duration_min <= 0:
+                raise ValueError("飛行時間は1分以上で指定してください。")
+        return self
 
 
 @dataclass(frozen=True)
@@ -1197,6 +1295,142 @@ async def get_backup() -> JSONResponse:
             detail="バックアップの形式が不正です。",
         )
     return JSONResponse(content=data, headers={"Cache-Control": "no-store"})
+
+
+def _empty_flight_records() -> dict[str, Any]:
+    """飛行記録ストアの初期構造。"""
+
+    return {"version": 1, "records": []}
+
+
+def _load_flight_records() -> dict[str, Any]:
+    """``data/flight_records.json`` を読む（無ければ空）。"""
+
+    if not FLIGHT_RECORDS_PATH.is_file():
+        return _empty_flight_records()
+    try:
+        raw = FLIGHT_RECORDS_PATH.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        logger.exception("failed to read flight records: %s", FLIGHT_RECORDS_PATH)
+        raise HTTPException(
+            status_code=500,
+            detail="飛行記録を読み込めませんでした。",
+        ) from exc
+    if not isinstance(data, dict) or not isinstance(data.get("records"), list):
+        raise HTTPException(status_code=500, detail="飛行記録の形式が不正です。")
+    return data
+
+
+def _write_flight_records(data: dict[str, Any]) -> None:
+    """一時ファイル経由で原子的に書き込む（0700 / 0600）。"""
+
+    body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    if len(body) > MAX_FLIGHT_RECORDS_BYTES:
+        raise HTTPException(status_code=413, detail="飛行記録が大きすぎます（上限10MB）。")
+    DATA_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(DATA_DIR, 0o700)
+    FLIGHT_RECORDS_TMP_PATH.write_bytes(body)
+    os.chmod(FLIGHT_RECORDS_TMP_PATH, 0o600)
+    FLIGHT_RECORDS_TMP_PATH.replace(FLIGHT_RECORDS_PATH)
+
+
+def _next_flight_id(records: list[dict[str, Any]]) -> str:
+    """``FLT-0001`` 形式の連番を採番する。"""
+
+    max_no = 0
+    for record in records:
+        found = re.fullmatch(r"FLT-(\d+)", str(record.get("flight_id") or ""))
+        if found:
+            max_no = max(max_no, int(found.group(1)))
+    return f"FLT-{max_no + 1:04d}"
+
+
+@app.post("/api/flight-records", summary="飛行記録を保存（upsert）")
+async def upsert_flight_record(payload: FlightRecordPayload) -> dict[str, Any]:
+    """PWA の飛行記録（status・点検13項目）を検証して保存する。
+
+    ``flight_id`` 付きの場合は既存レコードを更新する（フェーズ3からの再開・完了保存）。
+    ``status`` 省略時は ``completed`` として扱う（後方互換）。
+    """
+
+    now = datetime.now(JST).isoformat(timespec="seconds")
+    async with FLIGHT_RECORDS_LOCK:
+        store = _load_flight_records()
+        records: list[dict[str, Any]] = store["records"]
+
+        existing_index: int | None = None
+        if payload.flight_id:
+            for index, row in enumerate(records):
+                if row.get("flight_id") == payload.flight_id:
+                    existing_index = index
+                    break
+            if existing_index is None:
+                raise HTTPException(
+                    status_code=404,
+                    detail="更新対象の飛行記録が見つかりません。",
+                )
+
+        record = payload.model_dump()
+        if existing_index is None:
+            if len(records) >= MAX_FLIGHT_RECORDS:
+                raise HTTPException(
+                    status_code=409,
+                    detail="飛行記録の上限（5000件）に達しました。",
+                )
+            record["flight_id"] = _next_flight_id(records)
+            record["created_at"] = now
+            record["updated_at"] = now
+            records.append(record)
+        else:
+            record["flight_id"] = payload.flight_id
+            record["created_at"] = str(records[existing_index].get("created_at") or now)
+            record["updated_at"] = now
+            records[existing_index] = record
+
+        try:
+            _write_flight_records(store)
+        except OSError as exc:
+            logger.exception("failed to save flight records: %s", FLIGHT_RECORDS_PATH)
+            raise HTTPException(
+                status_code=500,
+                detail="飛行記録を保存できませんでした。",
+            ) from exc
+
+    logger.info(
+        "flight record saved: %s status=%s",
+        record.get("flight_id"),
+        record.get("status"),
+    )
+    return {"ok": True, "record": record}
+
+
+@app.get("/api/flight-records", summary="飛行記録の一覧")
+async def list_flight_records(
+    status: str | None = Query(
+        None,
+        pattern="^(pre_flight_ready|completed)$",
+        description="pre_flight_ready / completed で絞り込む",
+    ),
+    limit: int = Query(200, ge=1, le=1000),
+) -> dict[str, Any]:
+    """保存済みの飛行記録を新しい順で返す。"""
+
+    store = _load_flight_records()
+    records: list[dict[str, Any]] = store["records"]
+    if status:
+        records = [row for row in records if row.get("status") == status]
+    records = sorted(
+        records,
+        key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""),
+        reverse=True,
+    )
+    return {
+        "ok": True,
+        "total": len(records),
+        "status": status or "all",
+        "records": records[:limit],
+    }
 
 
 def _infra_cache_key(lat: float, lon: float, radius: int) -> tuple[float, float, int]:
